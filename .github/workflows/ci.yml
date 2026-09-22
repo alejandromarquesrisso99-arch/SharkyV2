@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Comprobar y compilar en Windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Preparar uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Instalar el entorno exacto de uv.lock
+        run: uv sync --locked
+
+      - name: Estilo
+        run: uv run ruff check .
+
+      - name: Tests
+        run: uv run pytest
+
+      - name: Instalar Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Compilar el ejecutable y el instalador
+        run: uv run python scripts/build.py
+
+      - name: Guardar el informe de la autocomprobación
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autocomprobacion
+          path: ${{ runner.temp }}/sharky_selftest.txt
+          if-no-files-found: warn
+
+      - name: Guardar el instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sharky-Setup
+          path: dist/Sharky-Setup-*.exe
+          if-no-files-found: error

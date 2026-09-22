@@ -11,8 +11,9 @@ La especificación completa y única del proyecto es [GUIA_SHARKY.md](GUIA_SHARK
 
 ## Estado
 
-En construcción. Último hito cerrado: **H1 — App vacía empaquetada** (ventana con las siete
-secciones vacías, temas claro y oscuro, autocomprobación y ejecutable).
+En construcción. Último hito cerrado: **H2 — Instalador, CI y prueba en el otro PC**
+(ventana con las siete secciones vacías, temas claro y oscuro, autocomprobación, ejecutable e
+instalador).
 
 ## Requisitos de desarrollo
 
@@ -35,9 +36,15 @@ uv run pytest         # tests
 uv run python scripts/build.py
 ```
 
-Genera `dist\Sharky\Sharky.exe` (PyInstaller, modo carpeta, sin consola) y lanza la
-autocomprobación del propio ejecutable, sin red y con red. Desde H2 compilará además el
-instalador `dist\Sharky-Setup-<versión>.exe` (Inno Setup).
+Genera `dist\Sharky\Sharky.exe` (PyInstaller, modo carpeta, sin consola), lanza la
+autocomprobación del propio ejecutable —sin red y con red— y, solo si sale limpia, compila
+`dist\Sharky-Setup-<versión>.exe` con Inno Setup.
+
+Hace falta Inno Setup 6. Si no está:
+
+```bash
+winget install --id JRSoftware.InnoSetup -e
+```
 
 El icono se regenera solo cuando cambie el dibujo:
 
@@ -57,6 +64,16 @@ dist\Sharky\Sharky.exe --selftest --online
 Escribe el resultado en `%TEMP%\sharky_selftest.txt` y sale con 0 o 1. Un **FALLO** significa
 que al programa le falta algo por dentro; un **AVISO** significa que algo de fuera (la red,
 Yahoo) no ha respondido, y no cuenta como fallo.
+
+## Cómo se instala
+
+El instalador es por usuario: **no pide administrador** y no necesita Python. Deja el programa
+en `%LOCALAPPDATA%\Programs\Sharky` y un acceso en el menú Inicio (el del escritorio es
+opcional). Al desinstalar se borra el programa y el arranque con Windows, pero **nunca la
+carpeta de datos**.
+
+Windows avisará de que el instalador no está firmado: «Más información → Ejecutar de todas
+formas».
 
 ## Datos
 
