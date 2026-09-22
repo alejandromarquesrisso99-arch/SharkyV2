@@ -11,7 +11,8 @@ La especificación completa y única del proyecto es [GUIA_SHARKY.md](GUIA_SHARK
 
 ## Estado
 
-En construcción. Hito actual: **H0 — Repositorio y entorno**.
+En construcción. Último hito cerrado: **H1 — App vacía empaquetada** (ventana con las siete
+secciones vacías, temas claro y oscuro, autocomprobación y ejecutable).
 
 ## Requisitos de desarrollo
 
@@ -30,14 +31,32 @@ uv run pytest         # tests
 
 ## Cómo compilar
 
-Disponible a partir del hito H1:
-
 ```bash
 uv run python scripts/build.py
 ```
 
-Genera `dist\Sharky\Sharky.exe` (PyInstaller, modo carpeta, sin consola) y, desde H2, el
+Genera `dist\Sharky\Sharky.exe` (PyInstaller, modo carpeta, sin consola) y lanza la
+autocomprobación del propio ejecutable, sin red y con red. Desde H2 compilará además el
 instalador `dist\Sharky-Setup-<versión>.exe` (Inno Setup).
+
+El icono se regenera solo cuando cambie el dibujo:
+
+```bash
+uv run python scripts/make_icon.py
+```
+
+## Autocomprobación
+
+El ejecutable sabe revisarse a sí mismo, sin abrir ninguna ventana:
+
+```bash
+dist\Sharky\Sharky.exe --selftest
+dist\Sharky\Sharky.exe --selftest --online
+```
+
+Escribe el resultado en `%TEMP%\sharky_selftest.txt` y sale con 0 o 1. Un **FALLO** significa
+que al programa le falta algo por dentro; un **AVISO** significa que algo de fuera (la red,
+Yahoo) no ha respondido, y no cuenta como fallo.
 
 ## Datos
 

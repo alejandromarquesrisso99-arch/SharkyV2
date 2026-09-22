@@ -324,9 +324,11 @@ Cada paso queda en `runs`; si alguno falla, notificación «Algo no ha ido bien 
 4. **Tesis**: activas y cerradas, editor, historial, propuestas pendientes con «Aplicar» o «Descartar» y «Alta rápida» para poner stop y objetivo a todas las posiciones sin tesis desde una tabla (entrada = coste medio y niveles en EUR por defecto).
 5. **Radar**: alertas activas con sus niveles, ratio y caída desde el máximo, y botones «Comprar» y «Descartar»; historial de alertas caducadas y ejecutadas; candidatos descartados por el filtro con su motivo; lista de vigilancia editable; botón «Buscar oportunidades nuevas» con su precio aproximado.
 6. **Informes**: lista por tipo y fecha (diario, semanal, mensual y exploraciones), lector Markdown (QTextBrowser), marca «Sin IA», coste de cada informe y exportar a `.md`.
-7. **Ajustes**: Claude (clave, probar, borrar, modelo y esfuerzo de cada acción, precios, tope de gasto y gasto del mes), Mandato, Radar (vigencia de las alertas y umbrales del filtro), Automatización (inicio con Windows, día del semanal), Datos (abrir carpeta, copia ahora, copia en otra carpeta, restaurar), Registro de ejecuciones y Acerca de (versión).
+7. **Ajustes**: Claude (clave, probar, borrar, modelo y esfuerzo de cada acción, precios, tope de gasto y gasto del mes), Mandato, Apariencia (tema), Radar (vigencia de las alertas y umbrales del filtro), Automatización (inicio con Windows, día del semanal), Datos (abrir carpeta, copia ahora, copia en otra carpeta, restaurar), Registro de ejecuciones y Acerca de (versión).
 
 Diseño sobrio: tablas legibles y color solo para estados (verde, ámbar, rojo). Ninguna acción larga congela la ventana: barra de progreso y «Cancelar» cuando sea posible.
+
+**Tema claro y tema oscuro**, los dos completos, más la opción «el que tenga Windows» (la de por defecto). Se elige en Ajustes → Apariencia y también con un botón en la cabecera de cada pantalla; el cambio se aplica al momento, sin reiniciar, y se recuerda. Toda la paleta vive en un único sitio (`ui/theme.py`: un diccionario de tokens por tema —fondos, superficies, líneas, texto, acento y los tres colores de estado—) y ningún widget escribe un color a mano. En los dos temas, el texto normal mantiene un contraste de 4,5:1 como mínimo y los estados se distinguen sin depender solo del color (llevan siempre su etiqueta). El gráfico y los iconos toman sus colores de los mismos tokens.
 
 ---
 
@@ -392,7 +394,7 @@ Aceptación:
 
 ### H1 · App vacía empaquetada
 
-1. Ventana principal con las seis secciones vacías, icono y versión en «Acerca de».
+1. Ventana principal con las siete secciones vacías, icono, versión en «Acerca de» y `ui/theme.py` con los tokens de los dos temas (§5.10) aplicados a la paleta de Qt desde el primer día: añadir el tema oscuro al final siempre sale mal.
 2. `paths.py`: carpeta de datos (§5.1) y `resource_path()`, válido en desarrollo y dentro del exe.
 3. Arranque robusto: `stdout` y `stderr` nulos → `os.devnull`; logging rotativo; `sys.excepthook` que registra el error y muestra un diálogo; instancia única; icono en la bandeja (si no hay bandeja disponible, seguir sin ella).
 4. `--selftest`, sin ventana: comprueba Qt en modo offscreen, SQLite en una carpeta temporal, keyring (guardar, leer y borrar una credencial de prueba), los imports de yfinance, anthropic y pyqtgraph y los recursos del paquete. Cada hito posterior le añade lo suyo (por ejemplo, H4 lee la plantilla CSV). Con `--online`, además: una cotización real y una conexión TLS con api.anthropic.com. Escribe el resultado en `%TEMP%\sharky_selftest.txt` y sale con 0 o 1. Distingue «falta algo dentro del exe» (fallo) de «Yahoo no responde ahora» (aviso).
@@ -529,6 +531,7 @@ Aceptación, en el otro PC y solo con el instalador:
 - [ ] Instalar sin Python ni consola; asistente con clave y CSV; Panel correcto.
 - [ ] Registrar una compra, una venta y una tesis con stop.
 - [ ] Generar un diario, un semanal y un mensual, y lanzar una búsqueda de oportunidades: cada botón enseña antes su precio aproximado y después el real.
+- [ ] Cambiar a tema oscuro y recorrer las siete pantallas: ningún texto ilegible, ningún estado que se pierda, ningún color escrito a mano fuera de `ui/theme.py`.
 - [ ] Reiniciar el PC → la rutina se ejecuta sola desde la bandeja.
 - [ ] Hacer una copia de seguridad, restaurarla en una instalación limpia y comprobar que están los mismos datos (la clave se vuelve a pedir: no viaja en la copia).
 
