@@ -36,12 +36,21 @@ jobs:
       - name: Compilar el ejecutable y el instalador
         run: uv run python scripts/build.py
 
+      # El ejecutable escribe su informe en %TEMP%, que en el runner no es runner.temp.
+      - name: Recoger el informe de la autocomprobación
+        if: always()
+        shell: pwsh
+        run: |
+          $origen = Join-Path $env:TEMP "sharky_selftest.txt"
+          $destino = Join-Path "${{ runner.temp }}" "informe-autocomprobacion.txt"
+          if (Test-Path $origen) { Copy-Item $origen $destino -Force }
+
       - name: Guardar el informe de la autocomprobación
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: autocomprobacion
-          path: ${{ runner.temp }}/sharky_selftest.txt
+          path: ${{ runner.temp }}/informe-autocomprobacion.txt
           if-no-files-found: warn
 
       - name: Guardar el instalador
