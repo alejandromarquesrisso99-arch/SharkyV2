@@ -1,0 +1,20 @@
+# Entorno
+.venv/
+
+# Cachés de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Compilación y empaquetado
+build/
+dist/
+
+# Datos y secretos: nunca se commitean
+*.db*
+*.csv
+.env
+logs/
+*.log
