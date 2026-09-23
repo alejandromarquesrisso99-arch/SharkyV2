@@ -1,8 +1,5 @@
 """La autocomprobación: sin red, sin clave y sin tocar el Administrador de credenciales."""
 
-import pytest
-
-from fakes import FakeKeyring
 from sharky.services import selftest
 from sharky.services.selftest import (
     Check,
@@ -15,14 +12,7 @@ from sharky.services.selftest import (
     write_report,
 )
 
-
-@pytest.fixture
-def keyring_falso(monkeypatch):
-    """El Administrador de credenciales de verdad no se toca en los tests."""
-    falso = FakeKeyring()
-    monkeypatch.setattr(selftest, "keyring", falso)
-    monkeypatch.setattr(selftest, "configure_keyring", lambda: "FakeKeyring")
-    return falso
+# El Administrador de credenciales falso lo pone conftest.py (keyring_falso) en todos.
 
 
 def test_sin_red_todo_correcto(keyring_falso, qapp):
@@ -113,3 +103,18 @@ def test_el_informe_explica_los_avisos_y_los_fallos():
     assert "0 correctas, 1 avisos, 1 fallos" in texto
     assert "Los avisos no son fallos del programa" in texto
     assert "revisa el empaquetado" in texto
+
+
+def test_la_autocomprobacion_revisa_la_base_de_datos_y_los_ajustes():
+    nombres = [c.name for c in build_checks(online=False)]
+    assert "Base de datos" in nombres
+    assert "Ajustes" in nombres
+
+
+def test_la_autocomprobacion_no_toca_los_datos_del_usuario(carpeta_de_datos):
+    informe = run_selftest(checks=[c for c in build_checks() if c.name in
+                                   ("Base de datos", "Ajustes")])
+    assert all(r.status is Status.OK for r in informe.results), informe.results
+    assert not (carpeta_de_datos / "sharky.db").exists()
+    assert not (carpeta_de_datos / "settings.json").exists()
+    assert not (carpeta_de_datos / "backups").exists()

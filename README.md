@@ -11,9 +11,10 @@ La especificación completa y única del proyecto es [GUIA_SHARKY.md](GUIA_SHARK
 
 ## Estado
 
-En construcción. Último hito cerrado: **H2 — Instalador, CI y prueba en el otro PC**
-(ventana con las siete secciones vacías, temas claro y oscuro, autocomprobación, ejecutable e
-instalador).
+En construcción. Último hito cerrado: **H3 — Base de datos, ajustes y clave** (base de
+datos con migraciones, libro derivado de las operaciones, ajustes, clave en el Administrador de
+credenciales y copias de seguridad). Antes: ventana con las siete secciones, temas claro y
+oscuro, autocomprobación, ejecutable, instalador y CI.
 
 ## Requisitos de desarrollo
 
@@ -79,3 +80,20 @@ formas».
 
 El programa y los datos viven separados. Los datos están en `%LOCALAPPDATA%\Sharky\` y nunca se
 commitean. La variable de entorno `SHARKY_DATA_DIR` sustituye esa ruta (la usan los tests).
+
+```
+sharky.db       fuente de verdad (SQLite, modo WAL, esquema versionado con migraciones)
+settings.json   ajustes, sin secretos
+logs\           sharky.log rotativo
+backups\        copias de sharky.db (se guardan las 14 últimas)
+cache\          caché del mercado
+```
+
+- Las posiciones no se guardan: se calculan a partir de las operaciones con coste medio
+  ponderado. El efectivo es la suma de los movimientos de efectivo.
+- La clave de Claude vive en el Administrador de credenciales de Windows (servicio `Sharky`),
+  nunca en un fichero. Las copias de seguridad no la llevan.
+- Ajustes → Datos: «Copia de seguridad ahora» y «Restaurar copia…». Restaurar pide
+  confirmación, guarda antes una copia de lo que hay y reinicia Sharky.
+- Si `settings.json` se estropea, Sharky arranca con los valores por defecto y aparta el
+  fichero dañado como `settings.danado.json`.

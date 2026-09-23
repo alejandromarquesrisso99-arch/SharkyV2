@@ -1,7 +1,9 @@
 """Autocomprobación del programa: `Sharky.exe --selftest` (GUIA §7, H1).
 
-Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, SQLite, el
-Administrador de credenciales, las bibliotecas de mercado e IA y los recursos del paquete.
+Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, la base de
+datos (esquema, migraciones, copia y restauración), los ajustes, el Administrador de
+credenciales, las bibliotecas de mercado e IA y los recursos del paquete. Todo lo que escribe
+va a una carpeta temporal: nunca toca los datos del usuario ni su clave.
 Con `--online` añade una cotización real y una conexión TLS con la API de Claude.
 
 Distingue dos cosas que no se parecen en nada:
@@ -26,13 +28,15 @@ import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 
 import keyring
 
 from sharky import __version__, paths
+from sharky.services import secrets as secret_store
 
 log = logging.getLogger(__name__)
 
@@ -169,30 +173,80 @@ def _check_qt() -> str:
     return f"PySide6 {PySide6.__version__}, plataforma «{plataforma}», estilo Fusion, pinta"
 
 
-def _check_sqlite() -> str:
-    with tempfile.TemporaryDirectory(prefix="sharky_selftest_") as carpeta:
-        ruta = Path(carpeta) / "prueba.db"
-        conexion = sqlite3.connect(ruta, timeout=5)
+def _check_database() -> str:
+    """Esquema, migraciones, una escritura, el libro y la copia de ida y vuelta."""
+    from sharky.core.ledger import build_ledger
+    from sharky.core.models import Asset, Trade, TradeKind
+    from sharky.services.backup import create_backup, restore_backup
+    from sharky.services.db import TABLES, Database, latest_version
+    from sharky.services.repositories import AssetRepository, TradeRepository
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_db_", ignore_cleanup_errors=True
+    ) as carpeta:
+        raiz = Path(carpeta)
+        db = Database(raiz / "sharky.db")
         try:
-            modo = conexion.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-            conexion.execute("PRAGMA busy_timeout=5000")
-            with conexion:
-                conexion.execute("CREATE TABLE prueba (valor TEXT NOT NULL)")
-                conexion.execute("INSERT INTO prueba VALUES (?)", ("sharky",))
-            fila = conexion.execute("SELECT valor FROM prueba").fetchone()
+            db.migrate()
+            if db.migrate() != 0 or db.user_version() != latest_version():
+                raise CheckFailure("migrar dos veces no deja el esquema igual")
+            faltan = set(TABLES) - db.tables()
+            if faltan:
+                raise CheckFailure(f"faltan tablas: {', '.join(sorted(faltan))}")
+            conexion = db.connection()
+            modo = conexion.execute("PRAGMA journal_mode").fetchone()[0]
+            espera = conexion.execute("PRAGMA busy_timeout").fetchone()[0]
+            foraneas = conexion.execute("PRAGMA foreign_keys").fetchone()[0]
+            if str(modo).lower() != "wal" or espera < 5000 or foraneas != 1:
+                raise CheckFailure(
+                    f"conexión mal configurada: modo {modo}, espera {espera}, "
+                    f"claves foráneas {foraneas}"
+                )
+
+            with db.transaction() as conn:
+                AssetRepository(conn).add(Asset("PRUEBA", "Prueba", "EUR"))
+                TradeRepository(conn).add(
+                    Trade(date(2026, 1, 2), "PRUEBA", TradeKind.OPENING, Decimal("3"),
+                          Decimal("10"), "EUR", Decimal("1"), Decimal("0"), Decimal("30"))
+                )
+            momento = datetime(2026, 1, 2, 12, 0, 0)
+            copia = create_backup(db, momento, raiz / "backups")
+            with db.transaction() as conn:
+                conn.execute("DELETE FROM trades")
+            restore_backup(db, copia, momento, raiz / "backups")
+            libro = build_ledger(TradeRepository(db.connection()).list_all())
+            posicion = libro.position("PRUEBA")
+            if posicion is None or posicion.units != Decimal("3"):
+                raise CheckFailure("la copia restaurada no trae lo que se guardó")
         finally:
-            conexion.close()
-    if not fila or fila[0] != "sharky":
-        raise CheckFailure("SQLite no ha devuelto lo que se acababa de escribir")
-    return f"SQLite {sqlite3.sqlite_version}, modo {modo}, escritura y lectura correctas"
+            db.close_all()
+    return (
+        f"SQLite {sqlite3.sqlite_version}, modo {modo}, esquema {latest_version()} "
+        f"({len(TABLES)} tablas); migrar dos veces, escribir, copiar y restaurar, correctos"
+    )
+
+
+def _check_settings() -> str:
+    from sharky.services.settings import Settings, SettingsStore
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_settings_", ignore_cleanup_errors=True
+    ) as carpeta:
+        almacen = SettingsStore(Path(carpeta) / "settings.json")
+        ajustes = Settings()
+        ajustes.appearance.theme = "oscuro"
+        almacen.save(ajustes)
+        if almacen.load() != ajustes:
+            raise CheckFailure("settings.json no devuelve lo que se guardó")
+        almacen.path.write_text("{ esto no es JSON", encoding="utf-8")
+        if almacen.load() != Settings():
+            raise CheckFailure("un settings.json dañado no vuelve a los valores por defecto")
+    return "pydantic: guardar (atómico), leer y recuperarse de un fichero dañado, correctos"
 
 
 def configure_keyring() -> str:
     """Fija el backend de Windows en código: dentro del exe no se descubre solo (GUIA §3)."""
-    from keyring.backends.Windows import WinVaultKeyring
-
-    keyring.set_keyring(WinVaultKeyring())
-    return type(keyring.get_keyring()).__name__
+    return secret_store.configure_backend()
 
 
 def _check_keyring() -> str:
@@ -278,7 +332,8 @@ def build_checks(online: bool = False) -> list[Check]:
     comprobaciones = [
         Check("Carpeta de datos", _check_data_dir),
         Check("Qt (sin ventanas)", _check_qt),
-        Check("SQLite", _check_sqlite),
+        Check("Base de datos", _check_database),
+        Check("Ajustes", _check_settings),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

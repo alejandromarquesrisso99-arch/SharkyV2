@@ -11,12 +11,18 @@ import argparse
 import logging
 import os
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import TracebackType
+from typing import TYPE_CHECKING
 
 from sharky import __version__, paths
+
+if TYPE_CHECKING:
+    from sharky.services.settings import Settings, SettingsStore
+    from sharky.ui.theme import ThemeController
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +152,52 @@ class SingleInstance:
         self._server = servidor
         return True
 
+    def close(self) -> None:
+        """Deja de escuchar: otra ejecución ya puede quedarse con el puesto."""
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+
+
+def restart_command() -> tuple[str, list[str]]:
+    """Programa y argumentos para volver a abrir Sharky (en el exe y en desarrollo)."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, []
+    return sys.executable, ["-m", "sharky.app"]
+
+
+def relaunch() -> bool:
+    """Abre otra instancia de Sharky, independiente de esta. True si se ha lanzado."""
+    from PySide6.QtCore import QProcess
+
+    programa, argumentos = restart_command()
+    lanzado = QProcess.startDetached(programa, argumentos)
+    # startDetached devuelve un bool o (bool, pid) según la versión de PySide6.
+    correcto = lanzado[0] if isinstance(lanzado, tuple) else bool(lanzado)
+    if correcto:
+        log.info("Sharky se reinicia")
+    else:
+        log.error("No se ha podido reiniciar Sharky (%s %s)", programa, argumentos)
+    return correcto
+
+
+def remember_theme(
+    controller: ThemeController, store: SettingsStore, settings: Settings
+) -> None:
+    """El tema elegido se guarda en settings.json en cuanto cambia (GUIA §5.10: se recuerda)."""
+
+    def guardar(*_args: object) -> None:
+        eleccion = str(controller.choice)
+        if settings.appearance.theme == eleccion:
+            return  # cambió Windows, no la elección
+        settings.appearance.theme = eleccion
+        try:
+            store.save(settings)
+        except OSError:
+            log.exception("No se ha podido guardar el tema elegido")
+
+    controller.themeChanged.connect(guardar)
+
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Argumentos de la línea de órdenes (el usuario normal no los usa nunca)."""
@@ -171,19 +223,31 @@ def _check_ui() -> str:
     """Comprobación de la interfaz para el `--selftest` (app.py sí puede mirar la capa ui)."""
     from PySide6.QtWidgets import QApplication
 
+    from sharky.services.db import Database
     from sharky.ui.main_window import MainWindow
     from sharky.ui.pages import SECTIONS
     from sharky.ui.theme import Theme, ThemeController
 
     app = QApplication.instance() or QApplication([])
     tema = ThemeController(app, Theme.LIGHT)
-    ventana = MainWindow(tema, __version__)
-    for seccion in SECTIONS:
-        ventana.show_section(seccion.key)
-    tema.set_theme(Theme.DARK)
-    ventana.close()
-    ventana.deleteLater()
-    return f"ventana creada, {len(SECTIONS)} secciones recorridas, temas claro y oscuro"
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_ui_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+        try:
+            db.migrate()
+            ventana = MainWindow(tema, __version__, db=db)
+            for seccion in SECTIONS:
+                ventana.show_section(seccion.key)
+            tema.set_theme(Theme.DARK)
+            ventana.close()
+            ventana.deleteLater()
+        finally:
+            db.close_all()
+    return (
+        f"ventana creada, {len(SECTIONS)} secciones recorridas (Ajustes con Datos), "
+        "temas claro y oscuro"
+    )
 
 
 def run_selftest(online: bool) -> int:
@@ -199,6 +263,9 @@ def run_gui() -> int:
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
+    from sharky.services import secrets
+    from sharky.services.db import Database, DatabaseError
+    from sharky.services.settings import SettingsStore
     from sharky.ui.main_window import MainWindow
     from sharky.ui.theme import Theme, ThemeController
     from sharky.ui.tray import create_tray
@@ -214,13 +281,47 @@ def run_gui() -> int:
         log.info("Ya hay una ventana de Sharky abierta: se le pide que salga al frente")
         return 0
 
-    tema = ThemeController(app, Theme.SYSTEM)
-    ventana = MainWindow(tema, __version__)
+    try:
+        secrets.configure_backend()
+    except Exception:  # sin Administrador de credenciales la app sigue, sin IA
+        log.exception("No se ha podido preparar el Administrador de credenciales")
+
+    almacen = SettingsStore()
+    ajustes = almacen.load()
+
+    db = Database(paths.db_path())
+    try:
+        aplicadas = db.migrate()
+    except DatabaseError as error:
+        log.exception("No se puede usar la base de datos")
+        show_error_dialog(error)
+        db.close_all()
+        return 1
+    log.info("Base de datos lista (esquema %d, %d migraciones aplicadas ahora)",
+             db.user_version(), aplicadas)
+
+    tema = ThemeController(app, Theme(ajustes.appearance.theme))
+    remember_theme(tema, almacen, ajustes)
+    ventana = MainWindow(tema, __version__, db=db)
     unica.listen(ventana.bring_to_front)
     bandeja = create_tray(ventana, ventana.bring_to_front, app.quit)
+
+    reinicio = {"pedido": False}
+
+    def pedir_reinicio() -> None:
+        reinicio["pedido"] = True
+        app.quit()
+
+    ventana.restartRequested.connect(pedir_reinicio)
     ventana.show()
     log.info("Ventana abierta (tema %s, bandeja %s)", tema.effective, "sí" if bandeja else "no")
-    return app.exec()
+    codigo = app.exec()
+
+    db.close_all()
+    if reinicio["pedido"]:
+        unica.close()  # si no, la instancia nueva creería que esta sigue abierta
+        relaunch()
+    return codigo
 
 
 def main(argv: Sequence[str] | None = None) -> int:

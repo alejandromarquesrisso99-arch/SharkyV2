@@ -1,0 +1,151 @@
+"""El libro: posiciones y PnL realizado a partir de las operaciones (GUIA §5.1).
+
+Las posiciones no se guardan en ningún sitio: se derivan siempre de `trades` con coste medio
+ponderado.
+
+- Una compra (o una APERTURA) suma sus unidades y su coste; la comisión de compra suma al
+  coste.
+- Una venta resta unidades al coste medio del momento; la comisión de venta resta del importe.
+  PnL realizado = importe neto de la venta − unidades × coste medio.
+- Vender todo deja la posición a cero, sin restos de redondeo: el coste que sale es justo el
+  que quedaba.
+
+El efectivo tampoco se guarda: es la suma de los movimientos de efectivo.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
+
+from sharky.core.formatting import format_units
+from sharky.core.models import CashMovement, Trade, TradeKind
+
+ZERO = Decimal("0")
+
+#: Aviso que la app enseña junto a cualquier PnL realizado.
+TAX_WARNING = (
+    "El PnL realizado se calcula con coste medio ponderado. No sirve para la declaración de "
+    "la renta: en España se usa FIFO."
+)
+
+
+class LedgerError(ValueError):
+    """Las operaciones no cuadran (por ejemplo, se vende más de lo que hay)."""
+
+
+@dataclass(frozen=True)
+class Position:
+    """Una posición abierta."""
+
+    ticker: str
+    units: Decimal
+    cost_eur: Decimal  # coste total de lo que queda, con las comisiones de compra
+
+    @property
+    def avg_cost_eur(self) -> Decimal:
+        """Coste medio por unidad, en EUR."""
+        return self.cost_eur / self.units
+
+
+@dataclass(frozen=True)
+class RealizedSale:
+    """Lo que dejó una venta."""
+
+    ticker: str
+    trade_date: date
+    units: Decimal
+    net_proceeds_eur: Decimal  # importe − comisión
+    cost_basis_eur: Decimal  # unidades × coste medio
+    closes_position: bool
+    trade_id: int | None = None
+
+    @property
+    def pnl_eur(self) -> Decimal:
+        return self.net_proceeds_eur - self.cost_basis_eur
+
+
+@dataclass(frozen=True)
+class Ledger:
+    """Posiciones abiertas y ventas realizadas."""
+
+    positions: dict[str, Position]
+    sales: tuple[RealizedSale, ...]
+
+    def position(self, ticker: str) -> Position | None:
+        return self.positions.get(ticker)
+
+    def realized_pnl_eur(self, ticker: str | None = None) -> Decimal:
+        """PnL realizado de todas las ventas, o solo de las de un ticker."""
+        return sum(
+            (v.pnl_eur for v in self.sales if ticker is None or v.ticker == ticker),
+            ZERO,
+        )
+
+
+def build_ledger(trades: Iterable[Trade]) -> Ledger:
+    """Recorre las operaciones por fecha y construye el libro.
+
+    Dentro del mismo día se respeta el orden en que llegan (el repositorio las da por id).
+    """
+    unidades: dict[str, Decimal] = {}
+    costes: dict[str, Decimal] = {}
+    ventas: list[RealizedSale] = []
+
+    for op in sorted(trades, key=lambda t: t.trade_date):
+        if op.units <= 0:
+            raise LedgerError(f"Operación de {op.ticker} con unidades no positivas: {op.units}")
+        tenia = unidades.get(op.ticker, ZERO)
+        coste = costes.get(op.ticker, ZERO)
+
+        if op.kind is TradeKind.SELL:
+            if op.units > tenia:
+                raise LedgerError(
+                    f"No se pueden vender {format_units(op.units)} unidades de {op.ticker}: "
+                    f"solo hay {format_units(tenia)}."
+                )
+            cierra = op.units == tenia
+            base = coste if cierra else op.units * coste / tenia
+            ventas.append(
+                RealizedSale(
+                    ticker=op.ticker,
+                    trade_date=op.trade_date,
+                    units=op.units,
+                    net_proceeds_eur=op.amount_eur - op.fee_eur,
+                    cost_basis_eur=base,
+                    closes_position=cierra,
+                    trade_id=op.id,
+                )
+            )
+            unidades[op.ticker] = tenia - op.units
+            costes[op.ticker] = ZERO if cierra else coste - base
+        else:
+            unidades[op.ticker] = tenia + op.units
+            costes[op.ticker] = coste + op.amount_eur + op.fee_eur
+
+    abiertas = {
+        ticker: Position(ticker=ticker, units=u, cost_eur=costes[ticker])
+        for ticker, u in sorted(unidades.items())
+        if u > 0
+    }
+    return Ledger(positions=abiertas, sales=tuple(ventas))
+
+
+def cash_balance(movements: Iterable[CashMovement]) -> Decimal:
+    """El efectivo es la suma de los movimientos de efectivo, con su signo."""
+    return sum((m.amount_eur for m in movements), ZERO)
+
+
+def trade_cash_amount(trade: Trade) -> Decimal | None:
+    """Lo que una operación mueve en el efectivo (su movimiento de tipo OPERACION).
+
+    Una compra saca importe + comisión; una venta mete importe − comisión. Una APERTURA no
+    mueve efectivo: la posición ya existía y el efectivo inicial es el que queda.
+    """
+    if trade.kind is TradeKind.OPENING:
+        return None
+    if trade.kind is TradeKind.BUY:
+        return -(trade.amount_eur + trade.fee_eur)
+    return trade.amount_eur - trade.fee_eur

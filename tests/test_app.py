@@ -101,3 +101,48 @@ def test_la_segunda_ejecucion_avisa_a_la_primera(qapp, qtbot):
 def test_sin_nadie_escuchando_no_hay_primera_instancia(qapp):
     solitaria = app.SingleInstance("sharky-test-nadie-escucha")
     assert solitaria.signal_running_instance() is False
+
+
+def test_cerrar_la_instancia_unica_deja_sitio_a_la_siguiente(qapp):
+    primera = app.SingleInstance("sharky-test-relevo")
+    assert primera.listen(lambda: None)
+    primera.close()
+    assert app.SingleInstance("sharky-test-relevo").signal_running_instance() is False
+    segunda = app.SingleInstance("sharky-test-relevo")
+    assert segunda.listen(lambda: None)
+    segunda.close()
+
+
+def test_reiniciar_en_el_exe_vuelve_a_abrir_el_exe(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\Programas\Sharky\Sharky.exe")
+    assert app.restart_command() == (r"C:\Programas\Sharky\Sharky.exe", [])
+
+
+def test_reiniciar_en_desarrollo_lanza_el_modulo(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    programa, argumentos = app.restart_command()
+    assert programa == sys.executable
+    assert argumentos == ["-m", "sharky.app"]
+
+
+def test_el_tema_elegido_se_recuerda(qapp):
+    from sharky.services.settings import Settings, SettingsStore
+    from sharky.ui.theme import Theme, ThemeController
+
+    almacen = SettingsStore()
+    ajustes = almacen.load()
+    controlador = ThemeController(qapp, Theme(ajustes.appearance.theme))
+    app.remember_theme(controlador, almacen, ajustes)
+
+    controlador.set_theme(Theme.DARK)
+    assert almacen.load().appearance.theme == "oscuro"
+    controlador.toggle()
+    assert almacen.load().appearance.theme == "claro"
+    controlador.set_theme(Theme.SYSTEM)
+    assert almacen.load().appearance.theme == "sistema"
+    assert almacen.load().mandate == Settings().mandate  # el resto, intacto
+
+    # Al volver a abrir, se arranca con el tema guardado.
+    assert Theme(SettingsStore().load().appearance.theme) is Theme.SYSTEM
+    controlador.set_theme(Theme.LIGHT)

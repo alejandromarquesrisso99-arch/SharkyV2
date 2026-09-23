@@ -1,25 +1,48 @@
 """Las siete secciones de la ventana (GUIA §5.10).
 
 En H1 están vacías a propósito: cada una dice qué vivirá en ella y en qué hito llega. La
-única que ya hace algo es Ajustes, con Apariencia (el tema) y Acerca de (la versión).
+única que ya hace algo es Ajustes, con Apariencia (el tema), Datos (copia de seguridad y
+restauración, H3) y Acerca de (la versión).
 """
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QFileDialog,
     QFrame,
+    QHBoxLayout,
     QLabel,
+    QMessageBox,
+    QPushButton,
     QRadioButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from sharky import paths
+from sharky.services.backup import (
+    KEEP_BACKUPS,
+    RestoreResult,
+    backup_time,
+    create_backup,
+    list_backups,
+    restore_backup,
+)
+from sharky.services.db import Database
 from sharky.ui.theme import THEME_LABELS, Theme, ThemeController
+from sharky.ui.workers import Worker, start
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -121,8 +144,148 @@ class PlaceholderPage(QWidget):
         caja.addStretch(1)
 
 
+class DataCard(QFrame):
+    """Ajustes → Datos: copia de seguridad y restauración (H3). El resto llega en H13.
+
+    Las dos acciones tocan el disco, así que corren en segundo plano. Restaurar pide
+    confirmación y, al terminar, pide reiniciar la app con `restartRequested`.
+    """
+
+    restartRequested = Signal()
+
+    def __init__(self, db: Database, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+        self._db = db
+        self._worker: Worker | None = None
+
+        caja = QVBoxLayout(self)
+        caja.setContentsMargins(20, 18, 20, 18)
+        caja.setSpacing(10)
+        titulo = QLabel("Datos")
+        titulo.setObjectName("cardTitle")
+        caja.addWidget(titulo)
+
+        ruta = muted(f"Carpeta de datos: {paths.data_dir()}")
+        ruta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        caja.addWidget(ruta)
+        self._last_label = muted("")
+        caja.addWidget(self._last_label)
+
+        fila = QHBoxLayout()
+        fila.setSpacing(10)
+        self.backup_button = QPushButton("Copia de seguridad ahora")
+        self.backup_button.clicked.connect(self.start_backup)
+        fila.addWidget(self.backup_button)
+        self.restore_button = QPushButton("Restaurar copia…")
+        self.restore_button.clicked.connect(self.start_restore)
+        fila.addWidget(self.restore_button)
+        fila.addStretch(1)
+        caja.addLayout(fila)
+
+        self.status_label = muted("")
+        caja.addWidget(self.status_label)
+        self.refresh()
+
+    # -- estado ------------------------------------------------------------------------
+
+    def refresh(self) -> None:
+        """Pone al día la línea de la última copia."""
+        copias = list_backups()
+        cuando = backup_time(copias[-1]) if copias else None
+        if cuando is None:
+            texto = "Todavía no hay ninguna copia de seguridad."
+        else:
+            texto = f"Última copia: {cuando:%d/%m/%Y %H:%M}."
+        self._last_label.setText(f"{texto} Se guardan las {KEEP_BACKUPS} últimas.")
+
+    def _set_busy(self, busy: bool, text: str) -> None:
+        self.backup_button.setEnabled(not busy)
+        self.restore_button.setEnabled(not busy)
+        self.status_label.setText(text)
+
+    def _run(self, worker: Worker, on_done: Callable[[Any], None]) -> None:
+        worker.signals.finished.connect(on_done)
+        worker.signals.failed.connect(self._on_failed)
+        self._worker = start(worker)  # se guarda: sin referencia, las señales se perderían
+
+    # -- copia -------------------------------------------------------------------------
+
+    def start_backup(self) -> None:
+        self._set_busy(True, "Haciendo la copia de seguridad…")
+        self._run(Worker(create_backup, self._db, datetime.now()), self._on_backup_done)
+
+    def _on_backup_done(self, ruta: Path) -> None:
+        self._set_busy(False, f"Copia guardada: {ruta.name}")
+        self.refresh()
+
+    # -- restauración ------------------------------------------------------------------
+
+    def start_restore(self) -> None:
+        ruta = self.choose_backup_file()
+        if ruta is None or not self.confirm_restore(ruta):
+            return
+        self._set_busy(True, "Restaurando la copia…")
+        self._run(Worker(restore_backup, self._db, ruta, datetime.now()), self._on_restore_done)
+
+    def _on_restore_done(self, resultado: RestoreResult) -> None:
+        self._set_busy(True, "Copia restaurada. Sharky se reinicia…")
+        log.info("Restauración terminada: se pide reiniciar Sharky")
+        self.notify_restart(resultado)
+        self.restartRequested.emit()
+
+    def _on_failed(self, mensaje: str) -> None:
+        self._set_busy(False, "")
+        self.refresh()
+        self.show_error(mensaje)
+
+    # -- diálogos (los tests los sustituyen) ---------------------------------------------
+
+    def choose_backup_file(self) -> Path | None:
+        ruta, _filtro = QFileDialog.getOpenFileName(
+            self,
+            "Elige la copia que quieres restaurar",
+            str(paths.backups_dir()),
+            "Copias de Sharky (*.db)",
+        )
+        return Path(ruta) if ruta else None
+
+    def confirm_restore(self, path: Path) -> bool:
+        cuando = backup_time(path)
+        fecha = f" del {cuando:%d/%m/%Y a las %H:%M}" if cuando else ""
+        caja = QMessageBox(self)
+        caja.setIcon(QMessageBox.Icon.Warning)
+        caja.setWindowTitle("Restaurar copia de seguridad")
+        caja.setText(f"¿Sustituir todos los datos por los de la copia{fecha}?")
+        caja.setInformativeText(
+            f"Fichero: {path.name}\n\n"
+            "Antes se guarda una copia de lo que hay ahora, por si te arrepientes. Al "
+            "terminar, Sharky se reiniciará. La clave de Claude no cambia."
+        )
+        restaurar = caja.addButton("Restaurar", QMessageBox.ButtonRole.AcceptRole)
+        cancelar = caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        caja.setDefaultButton(cancelar)
+        caja.exec()
+        return caja.clickedButton() is restaurar
+
+    def notify_restart(self, result: RestoreResult) -> None:
+        QMessageBox.information(
+            self,
+            "Copia restaurada",
+            f"Se han restaurado los datos de {result.restored_from.name}.\n\n"
+            f"Lo que había antes está en {result.safety_copy.name}.\n"
+            "Sharky se reinicia ahora.",
+        )
+
+    def show_error(self, message: str) -> None:
+        QMessageBox.warning(self, "Sharky", message)
+
+
 class SettingsPage(QWidget):
-    """Ajustes: en H1 solo Apariencia y Acerca de; el resto llega en H13."""
+    """Ajustes: Apariencia, Datos y Acerca de; el resto llega en H13."""
+
+    #: Tras restaurar una copia, la app tiene que reiniciarse.
+    restartRequested = Signal()
 
     def __init__(
         self,
@@ -130,15 +293,30 @@ class SettingsPage(QWidget):
         theme: ThemeController,
         version: str,
         parent: QWidget | None = None,
+        *,
+        db: Database | None = None,
     ) -> None:
         super().__init__(parent)
         self.section = section
         self._theme = theme
-        caja = QVBoxLayout(self)
+        exterior = QVBoxLayout(self)
+        exterior.setContentsMargins(0, 0, 0, 0)
+        desplazable = QScrollArea()
+        desplazable.setWidgetResizable(True)
+        desplazable.setFrameShape(QFrame.Shape.NoFrame)
+        exterior.addWidget(desplazable)
+        interior = QWidget()
+        desplazable.setWidget(interior)
+        caja = QVBoxLayout(interior)
         caja.setContentsMargins(0, 0, 0, 0)
         caja.setSpacing(16)
 
         caja.addWidget(self._appearance_card())
+        self.data_card: DataCard | None = None
+        if db is not None:
+            self.data_card = DataCard(db)
+            self.data_card.restartRequested.connect(self.restartRequested)
+            caja.addWidget(self.data_card)
         caja.addWidget(self._about_card(version))
 
         marco, contenido = card("El resto de Ajustes")
@@ -190,8 +368,13 @@ class SettingsPage(QWidget):
             boton.blockSignals(False)
 
 
-def build_page(section: Section, theme: ThemeController, version: str) -> QWidget:
+def build_page(
+    section: Section,
+    theme: ThemeController,
+    version: str,
+    db: Database | None = None,
+) -> QWidget:
     """La página de una sección."""
     if section.key == "ajustes":
-        return SettingsPage(section, theme, version)
+        return SettingsPage(section, theme, version, db=db)
     return PlaceholderPage(section)

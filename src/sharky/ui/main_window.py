@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
 )
 
 from sharky import paths
-from sharky.ui.pages import SECTIONS, Section, build_page
+from sharky.services.db import Database
+from sharky.ui.pages import SECTIONS, Section, SettingsPage, build_page
 from sharky.ui.theme import Theme, ThemeController
 
 log = logging.getLogger(__name__)
@@ -29,17 +30,23 @@ SIDEBAR_WIDTH = 236
 
 
 class MainWindow(QMainWindow):
-    """La ventana de Sharky. En H1 las siete secciones están vacías."""
+    """La ventana de Sharky. Casi todas las secciones siguen vacías hasta su hito."""
+
+    #: Hay que reiniciar la app (por ejemplo, tras restaurar una copia de seguridad).
+    restartRequested = Signal()
 
     def __init__(
         self,
         theme: ThemeController,
         version: str,
         parent: QWidget | None = None,
+        *,
+        db: Database | None = None,
     ) -> None:
         super().__init__(parent)
         self._theme = theme
         self._version = version
+        self._db = db
         self._buttons: dict[str, QToolButton] = {}
         self._pages: dict[str, QWidget] = {}
 
@@ -159,7 +166,9 @@ class MainWindow(QMainWindow):
 
         self._stack = QStackedWidget()
         for seccion in SECTIONS:
-            pagina = build_page(seccion, self._theme, self._version)
+            pagina = build_page(seccion, self._theme, self._version, self._db)
+            if isinstance(pagina, SettingsPage):
+                pagina.restartRequested.connect(self.restartRequested)
             self._pages[seccion.key] = pagina
             self._stack.addWidget(pagina)
         caja.addWidget(self._stack, 1)
