@@ -1,8 +1,9 @@
 """Autocomprobación del programa: `Sharky.exe --selftest` (GUIA §7, H1).
 
 Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, la base de
-datos (esquema, migraciones, copia y restauración), los ajustes, el Administrador de
-credenciales, las bibliotecas de mercado e IA y los recursos del paquete. Todo lo que escribe
+datos (esquema, migraciones, copia y restauración), los ajustes, la plantilla CSV del asistente,
+el Administrador de credenciales, las bibliotecas de mercado e IA y los recursos del paquete.
+Todo lo que escribe
 va a una carpeta temporal: nunca toca los datos del usuario ni su clave.
 Con `--online` añade una cotización real y una conexión TLS con la API de Claude.
 
@@ -244,6 +245,53 @@ def _check_settings() -> str:
     return "pydantic: guardar (atómico), leer y recuperarse de un fichero dañado, correctos"
 
 
+def _check_csv_template() -> str:
+    """H4: la plantilla CSV se lee sin errores y con ella se crea una cartera en una base de
+    datos temporal, en una transacción."""
+    from sharky.core.csv_import import TEMPLATE_CSV, build_opening, parse_positions_csv
+    from sharky.core.formatting import format_eur
+    from sharky.core.ledger import build_ledger
+    from sharky.services.db import Database
+    from sharky.services.repositories import (
+        CashMovementRepository,
+        TradeRepository,
+        create_portfolio,
+        has_portfolio,
+    )
+
+    lectura = parse_positions_csv(TEMPLATE_CSV.encode("utf-8-sig"))
+    if not lectura.ok or lectura.warnings or len(lectura.positions) != 3:
+        raise CheckFailure(
+            "la plantilla CSV no se lee bien: " + "; ".join(str(i) for i in lectura.issues)
+        )
+    efectivo = Decimal("1000")
+    apertura = build_opening(lectura.positions, efectivo, date(2026, 1, 2), "Bróker de prueba")
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_csv_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+        try:
+            db.migrate()
+            with db.transaction() as conn:
+                create_portfolio(conn, apertura)
+            conexion = db.connection()
+            if not has_portfolio(conexion):
+                raise CheckFailure("tras crear la cartera, la base de datos dice que no hay")
+            libro = build_ledger(TradeRepository(conexion).list_all())
+            costes = {t: p.avg_cost_eur for t, p in libro.positions.items()}
+            if costes != {p.ticker: p.avg_cost_eur for p in lectura.positions}:
+                raise CheckFailure("el coste medio del libro no es el de la plantilla")
+            if CashMovementRepository(conexion).balance() != efectivo:
+                raise CheckFailure("el efectivo inicial no cuadra")
+        finally:
+            db.close_all()
+    return (
+        f"plantilla con {len(lectura.positions)} posiciones y sin errores; cartera creada en una "
+        f"transacción (patrimonio a coste {format_eur(apertura.snapshot.nav_eur)})"
+    )
+
+
 def configure_keyring() -> str:
     """Fija el backend de Windows en código: dentro del exe no se descubre solo (GUIA §3)."""
     return secret_store.configure_backend()
@@ -334,6 +382,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Qt (sin ventanas)", _check_qt),
         Check("Base de datos", _check_database),
         Check("Ajustes", _check_settings),
+        Check("Plantilla CSV y cartera inicial", _check_csv_template),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

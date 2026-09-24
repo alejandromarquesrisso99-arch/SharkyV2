@@ -30,6 +30,8 @@ DAMAGED_SUFFIX = ".danado.json"
 REPLACE_ATTEMPTS = 5
 REPLACE_PAUSE_S = 0.05
 
+DEFAULT_BROKER = "Trade Republic"
+
 Effort = Literal["low", "medium", "high"]
 ThemeChoice = Literal["claro", "oscuro", "sistema"]
 
@@ -132,6 +134,12 @@ class AppearanceSettings(_Section):
     theme: ThemeChoice = "sistema"
 
 
+class PortfolioSettings(_Section):
+    """La cartera (GUIA §5.2). El bróker es solo una etiqueta: no entra en ningún cálculo."""
+
+    broker: str = Field(DEFAULT_BROKER, min_length=1, max_length=80)
+
+
 class Settings(_Section):
     """Todos los ajustes. Cada sección vuelve a sus valores por defecto con `Sección()`."""
 
@@ -140,6 +148,7 @@ class Settings(_Section):
     radar: RadarSettings = Field(default_factory=RadarSettings)
     automation: AutomationSettings = Field(default_factory=AutomationSettings)
     appearance: AppearanceSettings = Field(default_factory=AppearanceSettings)
+    portfolio: PortfolioSettings = Field(default_factory=PortfolioSettings)
 
 
 def atomic_write_text(path: Path, text: str) -> None:

@@ -11,10 +11,26 @@ La especificación completa y única del proyecto es [GUIA_SHARKY.md](GUIA_SHARK
 
 ## Estado
 
-En construcción. Último hito cerrado: **H3 — Base de datos, ajustes y clave** (base de
-datos con migraciones, libro derivado de las operaciones, ajustes, clave en el Administrador de
-credenciales y copias de seguridad). Antes: ventana con las siete secciones, temas claro y
-oscuro, autocomprobación, ejecutable, instalador y CI.
+En construcción. Último hito cerrado: **H4 — Asistente de primer arranque** (clave de Claude,
+cartera desde un CSV con vista previa y coste medio editable, efectivo, bróker y creación de la
+cartera en una sola transacción). Antes: base de datos con migraciones, libro derivado de las
+operaciones, ajustes, clave en el Administrador de credenciales, copias de seguridad, ventana
+con las siete secciones, temas claro y oscuro, autocomprobación, ejecutable, instalador y CI.
+
+## Primer arranque
+
+Mientras no hay cartera, Sharky abre un asistente en lugar de la ventana principal:
+
+1. **Clave de Claude**, con «Probar clave» (no gasta nada). Se puede dejar en blanco.
+2. **Tu cartera**: «Adjuntar CSV…» con vista previa y todos los errores a la vez, con su
+   línea; «Guardar plantilla CSV…»; efectivo en euros y bróker. Se puede empezar solo con
+   efectivo. El coste medio de cada posición se puede corregir en la vista previa.
+3. **Resumen** y «Crear cartera».
+
+Nada se escribe hasta «Crear cartera»; cancelar no deja rastro. El CSV lleva, en este orden,
+`ticker;nombre;isin;unidades;coste_medio_eur;divisa;sector;simbolo;clase` (separador `;`, `,`
+o tabulador, decimal con coma o punto, cabecera opcional, UTF-8 o ANSI de Excel). La plantilla
+la genera el propio asistente.
 
 ## Requisitos de desarrollo
 

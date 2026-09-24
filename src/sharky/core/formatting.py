@@ -1,13 +1,23 @@
-"""Cifras en formato español: «1.234,56 €», «12,3 %» y unidades con hasta 6 decimales."""
+"""Cifras en formato español: «1.234,56 €», «12,3 %» y unidades con hasta 6 decimales.
+
+Y al revés: los campos numéricos aceptan coma o punto como separador decimal.
+"""
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_UP, Decimal
+import re
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 UNITS_DECIMALS = 6
+PRICE_MIN_DECIMALS = 2
+PRICE_MAX_DECIMALS = 6
+
+_DIGITS = re.compile(r"^[+-]?(\d+([.,]\d*)?|[.,]\d+)$")
+# Con separador de miles: «1.234.567,89». Las llaves dobles son para str.format.
+_GROUPED = r"^[+-]?\d{{1,3}}(?:{sep}\d{{3}})+(?:{dec}\d*)?$"
 
 
-def _spanish(value: Decimal, decimals: int, trim: bool) -> str:
+def _spanish(value: Decimal, decimals: int, trim: bool, min_decimals: int = 0) -> str:
     redondeado = value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
     if redondeado == 0:
         redondeado = abs(redondeado)  # nada de «-0,00»
@@ -15,6 +25,7 @@ def _spanish(value: Decimal, decimals: int, trim: bool) -> str:
     entero, _, fraccion = texto.partition(".")
     if trim:
         fraccion = fraccion.rstrip("0")
+        fraccion = fraccion.ljust(min_decimals, "0")
     entero = entero.replace(",", ".")
     return f"{entero},{fraccion}" if fraccion else entero
 
@@ -22,3 +33,53 @@ def _spanish(value: Decimal, decimals: int, trim: bool) -> str:
 def format_units(value: Decimal) -> str:
     """Unidades: hasta 6 decimales, sin ceros de relleno. `Decimal("1234.5")` → «1.234,5»."""
     return _spanish(value, UNITS_DECIMALS, trim=True)
+
+
+def format_amount(value: Decimal) -> str:
+    """Importe con dos decimales y sin símbolo: `Decimal("2900")` → «2.900,00»."""
+    return _spanish(value, 2, trim=False)
+
+
+def format_eur(value: Decimal) -> str:
+    """Importe en euros: `Decimal("1234.5")` → «1.234,50 €»."""
+    return f"{format_amount(value)} €"
+
+
+def format_price(value: Decimal) -> str:
+    """Precio por unidad: al menos 2 decimales y hasta 6. `Decimal("4.5")` → «4,50»,
+    `Decimal("0.123456")` → «0,123456»."""
+    return _spanish(value, PRICE_MAX_DECIMALS, trim=True, min_decimals=PRICE_MIN_DECIMALS)
+
+
+def parse_decimal(text: str) -> Decimal:
+    """Un número escrito a mano o leído de un CSV, con coma o punto decimal.
+
+    - «1234,56», «1234.56», «0,5», «,5» y «10» valen lo que parece.
+    - Si aparecen los dos signos, el último es el decimal y el otro separa miles, en grupos
+      de tres: «1.234,56» y «1,234.56» son 1234,56.
+    - Con un solo signo, ese signo es el decimal: «2.900» es 2,9 (no 2900).
+    - Se ignoran los espacios (también el no separable que pone Excel).
+
+    Lanza ValueError si el texto no es un número.
+    """
+    limpio = re.sub(r"\s", "", text.replace(" ", "").replace(" ", ""))
+    if not limpio:
+        raise ValueError("vacío")
+    if "," in limpio and "." in limpio:
+        decimal_sep = "," if limpio.rfind(",") > limpio.rfind(".") else "."
+        miles = "." if decimal_sep == "," else ","
+        patron = _GROUPED.format(sep=re.escape(miles), dec=re.escape(decimal_sep))
+        if not re.match(patron, limpio):
+            raise ValueError(f"«{text.strip()}» no es un número")
+        limpio = limpio.replace(miles, "").replace(decimal_sep, ".")
+    elif _DIGITS.match(limpio):
+        limpio = limpio.replace(",", ".")
+    else:
+        raise ValueError(f"«{text.strip()}» no es un número")
+    try:
+        valor = Decimal(limpio)
+    except InvalidOperation as error:  # pragma: no cover - los patrones ya lo impiden
+        raise ValueError(f"«{text.strip()}» no es un número") from error
+    if not valor.is_finite():  # pragma: no cover - los patrones ya lo impiden
+        raise ValueError(f"«{text.strip()}» no es un número")
+    return valor

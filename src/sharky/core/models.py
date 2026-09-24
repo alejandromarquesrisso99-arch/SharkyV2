@@ -28,7 +28,9 @@ class AssetClass(StrEnum):
 
 
 class TradeKind(StrEnum):
-    OPENING = "APERTURA"  # posición que ya existía al crear la cartera, a coste medio
+    # Posición que ya existía al crear la cartera: a coste medio y en EUR (precio = coste
+    # medio, cambio 1, sin comisión). La divisa de cotización está en su activo.
+    OPENING = "APERTURA"
     BUY = "COMPRA"
     SELL = "VENTA"
 

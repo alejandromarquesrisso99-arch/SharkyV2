@@ -1,11 +1,11 @@
 """Configuración común de los tests: Qt sin ventanas, carpeta de datos de usar y tirar y ni
-rastro del Administrador de credenciales de verdad."""
+rastro del Administrador de credenciales de verdad ni de la API de Claude."""
 
 import os
 
 import pytest
 
-from fakes import FakeKeyring
+from fakes import FakeClaude, FakeKeyring
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -31,6 +31,16 @@ def keyring_falso(monkeypatch):
     monkeypatch.setattr(secrets, "configure_backend", lambda: "FakeKeyring")
     monkeypatch.setattr(selftest, "keyring", falso)
     monkeypatch.setattr(selftest, "configure_keyring", lambda: "FakeKeyring")
+    return falso
+
+
+@pytest.fixture(autouse=True)
+def claude_falso(monkeypatch):
+    """Ningún test habla con la API de Claude: `anthropic.Anthropic` es un doble sin red."""
+    import anthropic
+
+    falso = FakeClaude()
+    monkeypatch.setattr(anthropic, "Anthropic", falso)
     return falso
 
 

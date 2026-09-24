@@ -146,3 +146,45 @@ def test_el_tema_elegido_se_recuerda(qapp):
     # Al volver a abrir, se arranca con el tema guardado.
     assert Theme(SettingsStore().load().appearance.theme) is Theme.SYSTEM
     controlador.set_theme(Theme.LIGHT)
+
+
+class _AsistenteFalso:
+    """Hace de SetupWizard en run_setup_wizard: no enseña nada y devuelve lo que se le diga."""
+
+    resultado = 0
+    creados: list = []
+
+    def __init__(self, db, store, settings):
+        _AsistenteFalso.creados.append(self)
+        self.quit_al_ejecutar = None
+
+    def bring_to_front(self):
+        pass
+
+    def exec(self):
+        from PySide6.QtWidgets import QApplication
+
+        self.quit_al_ejecutar = QApplication.instance().quitOnLastWindowClosed()
+        return self.resultado
+
+    def deleteLater(self):
+        pass
+
+
+@pytest.mark.parametrize(("resultado", "creada"), [(1, True), (0, False)])
+def test_sin_cartera_el_asistente_decide_si_se_sigue(qapp, db, monkeypatch, resultado, creada):
+    from sharky.services.settings import Settings, SettingsStore
+    from sharky.ui import wizard
+
+    monkeypatch.setattr(wizard, "SetupWizard", _AsistenteFalso)
+    monkeypatch.setattr(_AsistenteFalso, "resultado", resultado)
+    _AsistenteFalso.creados.clear()
+    al_frente: dict = {}
+    antes = qapp.quitOnLastWindowClosed()
+
+    assert app.run_setup_wizard(qapp, db, SettingsStore(), Settings(), al_frente) is creada
+    (asistente,) = _AsistenteFalso.creados
+    # Mientras está abierto, cerrarlo no da la app por terminada; después, todo como estaba.
+    assert asistente.quit_al_ejecutar is False
+    assert qapp.quitOnLastWindowClosed() is antes
+    assert al_frente == {}

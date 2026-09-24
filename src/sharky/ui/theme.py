@@ -123,6 +123,44 @@ _STYLESHEET = Template(
         background-color: $accent; color: $accent_text; border: 1px solid $accent;
     }
     QPushButton:disabled { color: $text_muted; }
+    QPushButton#primary:disabled {
+        background-color: $surface; color: $text_muted; border: 1px solid $border;
+    }
+
+    QLabel#okText { color: $ok; font-weight: 600; }
+    QLabel#warnText { color: $warn; font-weight: 600; }
+    QLabel#dangerText { color: $danger; font-weight: 600; }
+    QFrame#warnBox { background-color: $surface; border: 1px solid $warn; border-radius: 8px; }
+    QFrame#dangerBox {
+        background-color: $surface; border: 1px solid $danger; border-radius: 8px;
+    }
+
+    QLabel#stepNumber {
+        background-color: $surface_alt; color: $text_muted; border-radius: 14px;
+        font-weight: 600; min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
+    }
+    QLabel#stepNumberCurrent {
+        background-color: $accent; color: $accent_text; border-radius: 14px;
+        font-weight: 600; min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
+    }
+    QLabel#stepNumberDone {
+        background-color: $ok; color: $surface; border-radius: 14px;
+        font-weight: 600; min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
+    }
+    QLabel#stepLabelCurrent { font-weight: 600; }
+
+    QLineEdit {
+        background-color: $surface; color: $text; border: 1px solid $border;
+        border-radius: 6px; padding: 6px 8px;
+    }
+    QLineEdit:focus { border: 1px solid $accent; }
+    QTableWidget {
+        background-color: $surface; color: $text; border: none; gridline-color: $border;
+    }
+    QHeaderView::section {
+        background-color: $surface; color: $text_muted; border: none;
+        border-bottom: 1px solid $border; padding: 6px 8px; font-weight: 600;
+    }
 
     QScrollArea { background-color: transparent; border: none; }
     QScrollArea > QWidget > QWidget { background-color: transparent; }

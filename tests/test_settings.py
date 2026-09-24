@@ -56,6 +56,7 @@ def test_los_valores_por_defecto_son_los_de_la_guia():
     assert s.automation.start_with_windows is True  # GUIA §5.2: la casilla sale marcada
     assert s.automation.weekly_report_weekday == 6  # domingo
     assert s.appearance.theme == "sistema"  # GUIA §5.10: el de Windows, por defecto
+    assert s.portfolio.broker == "Trade Republic"  # GUIA §5.2
 
 
 def test_sin_fichero_salen_los_valores_por_defecto(almacen, caplog):
@@ -72,6 +73,7 @@ def test_guardar_y_leer_da_lo_mismo(almacen):
     ajustes.radar.alert_validity_days = 45
     ajustes.automation.weekly_report_weekday = 4
     ajustes.appearance.theme = "oscuro"
+    ajustes.portfolio.broker = "Bróker de José"
     almacen.save(ajustes)
     assert almacen.path == paths.settings_path()
     assert almacen.load() == ajustes
@@ -80,7 +82,7 @@ def test_guardar_y_leer_da_lo_mismo(almacen):
 def test_el_fichero_se_puede_leer_y_no_guarda_ningun_secreto(almacen):
     almacen.save(Settings())
     datos = json.loads(almacen.path.read_text(encoding="utf-8"))
-    assert set(datos) == {"mandate", "ai", "radar", "automation", "appearance"}
+    assert set(datos) == {"mandate", "ai", "radar", "automation", "appearance", "portfolio"}
     texto = almacen.path.read_text(encoding="utf-8").lower()
     for palabra in ("api_key", "clave", "sk-ant", "password", "secret"):
         assert palabra not in texto
@@ -192,6 +194,8 @@ def test_asignar_un_valor_imposible_se_rechaza():
         ajustes.mandate.max_risk_per_trade_pct = 0
     with pytest.raises(ValidationError):
         ajustes.appearance.theme = "morado"
+    with pytest.raises(ValidationError):
+        ajustes.portfolio.broker = ""
 
 
 def test_restaurar_una_seccion_a_sus_valores_por_defecto():

@@ -26,6 +26,7 @@ from enum import StrEnum
 from functools import cache
 from typing import Any
 
+from sharky.core.csv_import import Opening
 from sharky.core.ledger import cash_balance
 from sharky.core.models import (
     AlertStatus,
@@ -360,6 +361,42 @@ class ReportRepository(_Repository):
 
     def list_all(self) -> list[Report]:
         return self._select(order="created_at DESC, id DESC")
+
+
+class PortfolioExistsError(RuntimeError):
+    """Ya hay una cartera: el asistente de primer arranque no escribe encima."""
+
+
+def has_portfolio(conn: sqlite3.Connection) -> bool:
+    """Hay cartera si hay alguna operación o algún movimiento de efectivo.
+
+    El asistente guarda siempre el movimiento INICIAL (aunque sea de 0 €), así que una cartera
+    recién creada sin posiciones también cuenta. Y nunca se ofrece el asistente sobre una base
+    de datos que ya tenga movimientos.
+    """
+    fila = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM trades) OR EXISTS (SELECT 1 FROM cash_movements)"
+    ).fetchone()
+    return bool(fila[0])
+
+
+def create_portfolio(conn: sqlite3.Connection, opening: Opening) -> None:
+    """Guarda la cartera inicial (GUIA §5.2): activos, operaciones APERTURA, efectivo INICIAL y
+    primera foto del NAV. Va dentro de la transacción de quien llama: o entra todo o nada.
+
+    Comprueba otra vez, ya dentro de la transacción, que no haya cartera.
+    """
+    _require_transaction(conn)
+    if has_portfolio(conn):
+        raise PortfolioExistsError("Ya hay una cartera en la base de datos: no se toca.")
+    activos = AssetRepository(conn)
+    for activo in opening.assets:
+        activos.add(activo)
+    operaciones = TradeRepository(conn)
+    for operacion in opening.trades:
+        operaciones.add(operacion)
+    CashMovementRepository(conn).add(opening.initial_cash)
+    NavSnapshotRepository(conn).save(opening.snapshot)
 
 
 class RunRepository(_Repository):

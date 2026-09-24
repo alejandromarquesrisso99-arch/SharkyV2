@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING
 from sharky import __version__, paths
 
 if TYPE_CHECKING:
+    from PySide6.QtWidgets import QApplication
+
+    from sharky.services.db import Database
     from sharky.services.settings import Settings, SettingsStore
     from sharky.ui.theme import ThemeController
 
@@ -242,12 +245,45 @@ def _check_ui() -> str:
             tema.set_theme(Theme.DARK)
             ventana.close()
             ventana.deleteLater()
+            _walk_setup_wizard(db, Path(carpeta))
         finally:
             db.close_all()
     return (
         f"ventana creada, {len(SECTIONS)} secciones recorridas (Ajustes con Datos), "
-        "temas claro y oscuro"
+        "temas claro y oscuro; asistente recorrido con la plantilla CSV"
     )
+
+
+def _walk_setup_wizard(db: Database, folder: Path) -> None:
+    """Recorre las tres páginas del asistente con la plantilla, sin red y sin guardar nada."""
+    from datetime import date
+
+    from sharky.core.csv_import import TEMPLATE_CSV
+    from sharky.services.ai import KeyCheck, KeyStatus
+    from sharky.services.selftest import CheckFailure
+    from sharky.services.settings import Settings, SettingsStore
+    from sharky.ui.wizard import SetupWizard
+
+    asistente = SetupWizard(
+        db,
+        SettingsStore(folder / "settings.json"),
+        Settings(),
+        key_checker=lambda _clave: KeyCheck(KeyStatus.VALID, "Clave válida."),
+        has_saved_key=False,
+        today=lambda: date(2026, 1, 2),
+    )
+    try:
+        asistente.restart()
+        asistente.next()
+        asistente.portfolio_page.load_csv_bytes(TEMPLATE_CSV.encode("utf-8-sig"), "plantilla")
+        asistente.portfolio_page.cash_edit.setText("1000")
+        if not asistente.portfolio_page.isComplete():
+            raise CheckFailure("el asistente no acepta la plantilla CSV")
+        asistente.next()
+        if not asistente.summary_page.isComplete():
+            raise CheckFailure("el resumen del asistente no queda listo")
+    finally:
+        asistente.deleteLater()  # nunca se ha enseñado: no hay nada que cerrar
 
 
 def run_selftest(online: bool) -> int:
@@ -258,6 +294,36 @@ def run_selftest(online: bool) -> int:
     return run_selftest_cli(online=online, checks=comprobaciones)
 
 
+def run_setup_wizard(
+    app: QApplication,
+    db: Database,
+    store: SettingsStore,
+    settings: Settings,
+    to_front: dict[str, Callable[[], None]],
+) -> bool:
+    """No hay cartera: el asistente de primer arranque (GUIA §5.2). True si se ha creado."""
+    from PySide6.QtWidgets import QDialog
+
+    from sharky.ui.wizard import SetupWizard
+
+    log.info("No hay cartera: se abre el asistente de primer arranque")
+    asistente = SetupWizard(db, store, settings)
+    to_front["mostrar"] = asistente.bring_to_front
+    # Al cerrarse el asistente todavía no hay ventana principal: que Qt no dé la app por
+    # terminada por quedarse sin ventanas.
+    anterior = app.quitOnLastWindowClosed()
+    app.setQuitOnLastWindowClosed(False)
+    try:
+        creada = asistente.exec() == QDialog.DialogCode.Accepted
+    finally:
+        app.setQuitOnLastWindowClosed(anterior)
+        to_front.pop("mostrar", None)
+        asistente.deleteLater()
+    if creada:
+        log.info("Cartera creada con el asistente: se abre la ventana principal")
+    return creada
+
+
 def run_gui() -> int:
     """Abre la ventana. Devuelve el código de salida del programa."""
     from PySide6.QtGui import QIcon
@@ -265,6 +331,7 @@ def run_gui() -> int:
 
     from sharky.services import secrets
     from sharky.services.db import Database, DatabaseError
+    from sharky.services.repositories import has_portfolio
     from sharky.services.settings import SettingsStore
     from sharky.ui.main_window import MainWindow
     from sharky.ui.theme import Theme, ThemeController
@@ -301,9 +368,20 @@ def run_gui() -> int:
              db.user_version(), aplicadas)
 
     tema = ThemeController(app, Theme(ajustes.appearance.theme))
+    # La instancia única trae al frente la ventana que haya: el asistente o la principal.
+    al_frente: dict[str, Callable[[], None]] = {}
+    unica.listen(lambda: al_frente["mostrar"]() if "mostrar" in al_frente else None)
+
+    if not has_portfolio(db.connection()):
+        if not run_setup_wizard(app, db, almacen, ajustes, al_frente):
+            db.close_all()
+            unica.close()
+            return 0
+        ajustes = almacen.load()  # el asistente ha guardado el bróker y el inicio con Windows
+
     remember_theme(tema, almacen, ajustes)
     ventana = MainWindow(tema, __version__, db=db)
-    unica.listen(ventana.bring_to_front)
+    al_frente["mostrar"] = ventana.bring_to_front
     bandeja = create_tray(ventana, ventana.bring_to_front, app.quit)
 
     reinicio = {"pedido": False}
