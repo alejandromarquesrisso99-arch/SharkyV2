@@ -11,7 +11,8 @@ que lo comprueba) y los estados llevan siempre su etiqueta, nunca solo el color.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from enum import StrEnum
 from string import Template
 
@@ -296,7 +297,8 @@ def apply_theme(app: QApplication, theme: Theme) -> Theme:
 class ThemeController(QObject):
     """Guarda el tema elegido, lo aplica y avisa a quien pinte por su cuenta.
 
-    El cambio se aplica al momento, sin reiniciar. Con SYSTEM, sigue a Windows en caliente.
+    El cambio se aplica al momento, sin reiniciar. Con SYSTEM, sigue a Windows en caliente,
+    salvo dentro de `held()`, que lo deja para después.
     """
 
     #: Se emite con el tema efectivo (claro u oscuro).
@@ -307,6 +309,8 @@ class ThemeController(QObject):
         self._app = app
         self._choice = Theme(theme)
         self._effective = apply_theme(app, self._choice)
+        self._holds = 0
+        self._pending = False
         try:
             app.styleHints().colorSchemeChanged.connect(self._on_system_change)
         except (AttributeError, RuntimeError):  # pragma: no cover - Qt sin la señal
@@ -322,6 +326,30 @@ class ThemeController(QObject):
         """El tema que se está viendo: claro u oscuro."""
         return self._effective
 
+    @property
+    def on_hold(self) -> bool:
+        """Hay un `held()` en curso: los cambios esperan."""
+        return self._holds > 0
+
+    @contextmanager
+    def held(self) -> Iterator[None]:
+        """Retiene los cambios de tema mientras dura y, al salir, aplica el último una vez.
+
+        Qt 6.11 revienta (violación de acceso) si la hoja de estilo de la aplicación cambia
+        con un QWizard vivo y el estilo Fusion. El asistente de primer arranque se abre dentro
+        de un `held()` y se destruye antes de salir de él: si Windows cambia de tema mientras
+        tanto, el cambio espera a que el asistente ya no exista.
+        """
+        self._holds += 1
+        try:
+            yield
+        finally:
+            self._holds -= 1
+            if not self._holds and self._pending:
+                self._pending = False
+                log.info("Se aplica el cambio de tema que esperaba")
+                self._apply()
+
     def set_theme(self, theme: Theme) -> Theme:
         """Cambia el tema elegido y lo aplica."""
         self._choice = Theme(theme)
@@ -332,6 +360,10 @@ class ThemeController(QObject):
         return self.set_theme(Theme.LIGHT if self._effective is Theme.DARK else Theme.DARK)
 
     def _apply(self) -> Theme:
+        if self._holds:
+            self._pending = True
+            log.info("Cambio de tema retenido hasta que se cierre el asistente")
+            return self._effective
         anterior = self._effective
         self._effective = apply_theme(self._app, self._choice)
         if self._effective != anterior:

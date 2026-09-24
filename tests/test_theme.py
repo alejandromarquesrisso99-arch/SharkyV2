@@ -126,3 +126,38 @@ def test_las_etiquetas_de_estado_contrastan_con_su_fondo(tema, estado):
 def test_mezclar_colores():
     assert theme.mix("#000000", "#FFFFFF", 0.5) == "#808080"
     assert theme.mix("#123456", "#FFFFFF", 0) == "#123456"
+
+
+def test_retener_el_tema_deja_el_cambio_para_despues(qapp, monkeypatch):
+    """Mientras el asistente está abierto, un cambio de tema de Windows espera (Qt 6.11
+    revienta si la hoja de estilo cambia con un QWizard vivo). Al salir se aplica el último,
+    una sola vez."""
+    controlador = ThemeController(qapp, Theme.SYSTEM)
+    avisos = []
+    controlador.themeChanged.connect(avisos.append)
+    hoja_antes = qapp.styleSheet()
+    efectivo_antes = controlador.effective
+    otro = Theme.DARK if efectivo_antes is Theme.LIGHT else Theme.LIGHT
+
+    with controlador.held():
+        assert controlador.on_hold
+        monkeypatch.setattr(theme, "system_theme", lambda: otro)
+        controlador._on_system_change()
+        monkeypatch.setattr(theme, "system_theme", lambda: efectivo_antes)
+        controlador._on_system_change()
+        monkeypatch.setattr(theme, "system_theme", lambda: otro)
+        controlador._on_system_change()
+        assert qapp.styleSheet() == hoja_antes  # nada aplicado todavía
+        assert controlador.effective is efectivo_antes
+        assert avisos == []
+        with controlador.held():  # se puede anidar
+            pass
+        assert avisos == []
+
+    assert not controlador.on_hold
+    assert controlador.effective is otro
+    assert avisos == [str(otro)]  # una sola vez, con el último
+    with controlador.held():
+        pass
+    assert avisos == [str(otro)]  # sin cambios pendientes, salir no aplica nada
+    apply_theme(qapp, Theme.LIGHT)

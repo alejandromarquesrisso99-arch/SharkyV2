@@ -153,10 +153,12 @@ class _AsistenteFalso:
 
     resultado = 0
     creados: list = []
+    tema = None
 
     def __init__(self, db, store, settings):
         _AsistenteFalso.creados.append(self)
         self.quit_al_ejecutar = None
+        self.tema_retenido = None
 
     def bring_to_front(self):
         pass
@@ -165,6 +167,7 @@ class _AsistenteFalso:
         from PySide6.QtWidgets import QApplication
 
         self.quit_al_ejecutar = QApplication.instance().quitOnLastWindowClosed()
+        self.tema_retenido = _AsistenteFalso.tema.on_hold
         return self.resultado
 
     def deleteLater(self):
@@ -175,16 +178,22 @@ class _AsistenteFalso:
 def test_sin_cartera_el_asistente_decide_si_se_sigue(qapp, db, monkeypatch, resultado, creada):
     from sharky.services.settings import Settings, SettingsStore
     from sharky.ui import wizard
+    from sharky.ui.theme import Theme, ThemeController
 
+    tema = ThemeController(qapp, Theme.LIGHT)
     monkeypatch.setattr(wizard, "SetupWizard", _AsistenteFalso)
     monkeypatch.setattr(_AsistenteFalso, "resultado", resultado)
+    monkeypatch.setattr(_AsistenteFalso, "tema", tema)
     _AsistenteFalso.creados.clear()
     al_frente: dict = {}
     antes = qapp.quitOnLastWindowClosed()
 
-    assert app.run_setup_wizard(qapp, db, SettingsStore(), Settings(), al_frente) is creada
+    assert app.run_setup_wizard(qapp, db, SettingsStore(), Settings(), al_frente, tema) is creada
     (asistente,) = _AsistenteFalso.creados
     # Mientras está abierto, cerrarlo no da la app por terminada; después, todo como estaba.
     assert asistente.quit_al_ejecutar is False
     assert qapp.quitOnLastWindowClosed() is antes
     assert al_frente == {}
+    # Con el asistente abierto, los cambios de tema esperan; al cerrarlo, ya no.
+    assert asistente.tema_retenido is True
+    assert not tema.on_hold

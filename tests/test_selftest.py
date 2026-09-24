@@ -164,13 +164,12 @@ def test_sin_red_la_cotizacion_real_es_un_aviso(monkeypatch):
 
 
 def test_la_comprobacion_de_la_interfaz_recorre_la_cartera(qapp):
-    from PySide6.QtCore import QCoreApplication, QEvent
-
     from sharky import app
+    from sharky.ui.theme import Theme, apply_theme
 
     detalle = app._check_ui()
-    # En el exe el proceso acaba aquí. En pytest sigue: que el asistente y la ventana que
-    # quedan pendientes de borrar se borren ya (un QWizard vivo con Fusion revienta al
-    # cambiar después la hoja de estilo: fallo de Qt 6.11).
-    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     assert "Cartera" in detalle
+    # No deja ningún asistente vivo: si lo dejara, cambiar ahora el tema dos veces haría
+    # reventar Qt 6.11 (y con él, pytest entero).
+    for tema in (Theme.DARK, Theme.LIGHT, Theme.DARK, Theme.LIGHT):
+        apply_theme(qapp, tema)

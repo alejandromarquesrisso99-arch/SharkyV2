@@ -407,3 +407,37 @@ def test_mientras_guarda_no_se_puede_cancelar(asistente):
     asistente._set_busy(False)
     asistente.reject()
     assert not asistente.isVisible()
+
+
+def test_windows_cambia_de_tema_con_el_asistente_abierto(qtbot, qapp, db, monkeypatch):
+    """Regresión: con el asistente abierto y el tema «el que tenga Windows», dos cambios de
+    tema de Windows hacían reventar Qt 6.11 (violación de acceso). Ahora esperan a que el
+    asistente se cierre y se borre, como hace run_setup_wizard."""
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    from sharky import app
+    from sharky.ui import theme
+    from sharky.ui.theme import Theme, ThemeController, apply_theme
+
+    # pytest-qt cierra los asistentes de los tests anteriores con deleteLater(), que queda
+    # pendiente: se borran ya, para que solo cuente el de esta prueba.
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    controlador = ThemeController(qapp, Theme.SYSTEM)
+    efectivo = controlador.effective
+    otro = Theme.DARK if efectivo is Theme.LIGHT else Theme.LIGHT
+    with controlador.held():
+        asistente = SetupWizard(
+            db, SettingsStore(), Settings(),
+            key_checker=lambda _clave: KeyCheck(KeyStatus.VALID, "Clave válida."),
+            has_saved_key=False, today=lambda: date(2026, 9, 24),
+        )
+        asistente.show()
+        qtbot.waitExposed(asistente)
+        for cambio in (otro, efectivo, otro):
+            monkeypatch.setattr(theme, "system_theme", lambda c=cambio: c)
+            controlador._on_system_change()
+        assert controlador.effective is efectivo  # retenido
+        asistente.close()
+        app.destroy_now(asistente)
+    assert controlador.effective is otro
+    apply_theme(qapp, Theme.LIGHT)

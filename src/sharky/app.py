@@ -106,6 +106,17 @@ def show_error_dialog(error: BaseException) -> None:
         log.exception("No se ha podido mostrar el diálogo de error")
 
 
+def destroy_now(obj: object) -> None:
+    """Borra ya un objeto de Qt, sin esperar a que el bucle de eventos procese su
+    `deleteLater()`. Hace falta con los QWizard: vivos, aunque estén ocultos, hacen reventar
+    Qt 6.11 al cambiar el tema (ver `ThemeController.held`)."""
+    from PySide6.QtCore import QCoreApplication, QEvent, QObject
+
+    obj.deleteLater()
+    if isinstance(obj, QObject):
+        QCoreApplication.sendPostedEvents(obj, QEvent.Type.DeferredDelete)
+
+
 def instance_key() -> str:
     """Nombre del servidor local de la instancia única, distinto para cada usuario."""
     usuario = os.environ.get("USERNAME") or os.environ.get("USER") or "usuario"
@@ -259,7 +270,7 @@ def _check_ui() -> str:
             tema.set_theme(Theme.DARK)
             cartera.grab()
             ventana.close()
-            ventana.deleteLater()
+            destroy_now(ventana)
             _walk_setup_wizard(db, Path(carpeta))
         finally:
             db.close_all()
@@ -298,7 +309,7 @@ def _walk_setup_wizard(db: Database, folder: Path) -> None:
         if not asistente.summary_page.isComplete():
             raise CheckFailure("el resumen del asistente no queda listo")
     finally:
-        asistente.deleteLater()  # nunca se ha enseñado: no hay nada que cerrar
+        destroy_now(asistente)  # nunca se ha enseñado: no hay nada que cerrar
 
 
 def run_selftest(online: bool) -> int:
@@ -315,25 +326,32 @@ def run_setup_wizard(
     store: SettingsStore,
     settings: Settings,
     to_front: dict[str, Callable[[], None]],
+    theme: ThemeController,
 ) -> bool:
-    """No hay cartera: el asistente de primer arranque (GUIA §5.2). True si se ha creado."""
+    """No hay cartera: el asistente de primer arranque (GUIA §5.2). True si se ha creado.
+
+    Mientras está abierto, un cambio de tema de Windows espera (`theme.held()`): con el
+    asistente vivo, cambiar la hoja de estilo hace reventar Qt 6.11. Al cerrarse, el asistente
+    se borra antes de aplicar lo que haya esperado.
+    """
     from PySide6.QtWidgets import QDialog
 
     from sharky.ui.wizard import SetupWizard
 
     log.info("No hay cartera: se abre el asistente de primer arranque")
-    asistente = SetupWizard(db, store, settings)
-    to_front["mostrar"] = asistente.bring_to_front
-    # Al cerrarse el asistente todavía no hay ventana principal: que Qt no dé la app por
-    # terminada por quedarse sin ventanas.
-    anterior = app.quitOnLastWindowClosed()
-    app.setQuitOnLastWindowClosed(False)
-    try:
-        creada = asistente.exec() == QDialog.DialogCode.Accepted
-    finally:
-        app.setQuitOnLastWindowClosed(anterior)
-        to_front.pop("mostrar", None)
-        asistente.deleteLater()
+    with theme.held():
+        asistente = SetupWizard(db, store, settings)
+        to_front["mostrar"] = asistente.bring_to_front
+        # Al cerrarse el asistente todavía no hay ventana principal: que Qt no dé la app por
+        # terminada por quedarse sin ventanas.
+        anterior = app.quitOnLastWindowClosed()
+        app.setQuitOnLastWindowClosed(False)
+        try:
+            creada = asistente.exec() == QDialog.DialogCode.Accepted
+        finally:
+            app.setQuitOnLastWindowClosed(anterior)
+            to_front.pop("mostrar", None)
+            destroy_now(asistente)
     if creada:
         log.info("Cartera creada con el asistente: se abre la ventana principal")
     return creada
@@ -390,7 +408,7 @@ def run_gui() -> int:
     unica.listen(lambda: al_frente["mostrar"]() if "mostrar" in al_frente else None)
 
     if not has_portfolio(db.connection()):
-        if not run_setup_wizard(app, db, almacen, ajustes, al_frente):
+        if not run_setup_wizard(app, db, almacen, ajustes, al_frente, tema):
             db.close_all()
             unica.close()
             return 0
