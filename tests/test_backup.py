@@ -16,12 +16,16 @@ from sharky.services.backup import (
     list_backups,
     restore_backup,
     validate_backup,
+    wipe_portfolio,
 )
-from sharky.services.db import Database, latest_version
+from sharky.services.db import TABLES, Database, latest_version
 from sharky.services.repositories import (
     AssetRepository,
     CashMovementRepository,
+    ThesisEventRepository,
+    ThesisRepository,
     TradeRepository,
+    has_portfolio,
 )
 
 MOMENTO = datetime(2026, 9, 23, 20, 30, 15)
@@ -217,3 +221,84 @@ def test_una_copia_de_un_esquema_anterior_se_migra_al_restaurar(tmp_path, db):
         assert contenido(nueva) == contenido(db)
     finally:
         nueva.close_all()
+
+
+# -- borrar la cartera ------------------------------------------------------------------
+
+
+def llenar_todo(db):
+    """Una cartera con de todo, incluida una tesis con historial (que no admite borrados)."""
+    from sharky.core.models import Author, Thesis, ThesisEvent, ThesisEventKind
+
+    llenar(db)
+    with db.transaction() as conn:
+        tesis = ThesisRepository(conn).add(Thesis("ACME", "EUR", date(2026, 9, 1), D("25.5")))
+        ThesisEventRepository(conn).add(
+            ThesisEvent(tesis, MOMENTO, ThesisEventKind.CREATED, Author.USER, "Idea inventada")
+        )
+
+
+def test_borrar_la_cartera_lo_borra_todo_y_deja_el_esquema_al_dia(db):
+    llenar_todo(db)
+    copia = wipe_portfolio(db, MOMENTO)
+
+    conn = db.connection()
+    assert not has_portfolio(conn)
+    for tabla in TABLES:
+        assert conn.execute(f"SELECT count(*) FROM {tabla}").fetchone()[0] == 0, tabla
+    assert db.user_version() == latest_version()
+    assert db.tables() == set(TABLES)
+    # El historial de las tesis sigue sin admitir borrados en la base de datos vacía.
+    triggers = {f[0] for f in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+    assert {"thesis_events_no_update", "thesis_events_no_delete"} <= triggers
+    assert copia.name == "sharky-20260923-203015-antes-de-borrar.db"
+
+
+def test_la_copia_de_antes_de_borrar_se_puede_restaurar(db):
+    llenar_todo(db)
+    antes = contenido(db)
+    copia = wipe_portfolio(db, MOMENTO)
+    assert list_backups() == [copia]
+    restore_backup(db, copia, MOMENTO + timedelta(minutes=5))
+    assert contenido(db) == antes
+    assert has_portfolio(db.connection())
+
+
+def test_la_copia_de_antes_de_borrar_entra_en_la_rotacion(db):
+    llenar(db)
+    copia = wipe_portfolio(db, MOMENTO)
+    for dia in range(1, KEEP_BACKUPS + 1):
+        create_backup(db, MOMENTO + timedelta(days=dia))
+    assert copia not in list_backups()  # 14 copias después, ya no está
+    assert len(list_backups()) == KEEP_BACKUPS
+
+
+def test_borrar_la_cartera_no_toca_ajustes_ni_clave(db, keyring_falso):
+    from sharky.services import secrets
+    from sharky.services.settings import Settings, SettingsStore
+
+    llenar(db)
+    ajustes = Settings()
+    ajustes.portfolio.broker = "Bróker inventado"
+    ajustes.appearance.theme = "oscuro"
+    SettingsStore().save(ajustes)
+    secrets.save_api_key("sk-ant-inventada-1234")
+
+    wipe_portfolio(db, MOMENTO)
+    assert SettingsStore().load() == ajustes
+    assert secrets.load_api_key() == "sk-ant-inventada-1234"
+
+
+def test_si_no_se_puede_hacer_la_copia_no_se_borra_nada(db, monkeypatch):
+    from sharky.services import backup
+
+    llenar(db)
+    antes = contenido(db)
+
+    def falla(*_args, **_kwargs):
+        raise BackupError("disco lleno")
+
+    monkeypatch.setattr(backup, "create_backup", falla)
+    with pytest.raises(BackupError, match="disco lleno"):
+        wipe_portfolio(db, MOMENTO)
+    assert contenido(db) == antes

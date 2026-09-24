@@ -8,6 +8,9 @@
   es de una versión más nueva; guarda una copia de lo que hay ahora; vuelca la copia sobre la
   base de datos con la misma API y aplica las migraciones que falten. Quien llama reinicia la
   app después.
+- Borrar la cartera guarda una copia de lo que hay (`…-antes-de-borrar.db`, que entra en la
+  rotación como cualquier otra) y vuelca encima una base de datos vacía con el esquema al día.
+  Quien llama reinicia la app, que abre el asistente de primer arranque.
 
 La hora llega siempre desde fuera: este módulo no lee el reloj.
 """
@@ -18,6 +21,7 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
 from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +37,7 @@ PREFIX = "sharky-"
 SUFFIX = ".db"
 PARTIAL_SUFFIX = ".parcial"
 BEFORE_RESTORE_LABEL = "antes-de-restaurar"
+BEFORE_WIPE_LABEL = "antes-de-borrar"
 _NAME = re.compile(r"^sharky-(\d{8}-\d{6})(?:-\d+)?(?:-[a-z-]+)?\.db$")
 #: Sin estas tablas, un fichero no es una copia de Sharky.
 REQUIRED_TABLES = frozenset({"assets", "trades", "cash_movements"})
@@ -185,3 +190,36 @@ def restore_backup(
         origen.name, version, aplicadas, seguridad.name,
     )
     return RestoreResult(restored_from=origen, safety_copy=seguridad)
+
+
+def wipe_portfolio(db: Database, now: datetime, folder: Path | None = None) -> Path:
+    """«Borrar cartera» (Ajustes → Datos): se borra todo lo que hay en la base de datos.
+
+    Primero guarda una copia de lo que hay (`…-antes-de-borrar.db`) y devuelve su ruta: con
+    «Restaurar copia…» se recupera mientras siga entre las 14 últimas. Después vuelca sobre la
+    base de datos una vacía con el esquema al día, con la misma API que restaurar: así no hace
+    falta borrar tabla a tabla (el historial de las tesis no admite borrados). Los ajustes, la
+    clave de Claude y las copias no se tocan. Quien llama reinicia la app.
+    """
+    seguridad = create_backup(db, now, folder, label=BEFORE_WIPE_LABEL)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="sharky_vacia_", ignore_cleanup_errors=True
+        ) as carpeta:
+            vacia = Database(Path(carpeta) / "sharky.db", db.migrations)
+            try:
+                vacia.migrate()
+                vacia.connection().backup(db.connection())
+            finally:
+                vacia.close_all()
+    except (sqlite3.Error, DatabaseError, OSError) as error:
+        log.exception("Borrar la cartera ha fallado")
+        raise BackupError(
+            f"No se ha podido borrar la cartera: {error}. Lo que había sigue en "
+            f"{seguridad.name}."
+        ) from error
+    faltan = set(TABLES) - db.tables()
+    if faltan:
+        raise BackupError(f"Tras borrar la cartera faltan tablas: {', '.join(sorted(faltan))}")
+    log.info("Cartera borrada. Lo que había quedó en %s", seguridad.name)
+    return seguridad

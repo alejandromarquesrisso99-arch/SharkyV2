@@ -127,6 +127,8 @@ _STYLESHEET = Template(
     QPushButton#primary:disabled {
         background-color: $surface; color: $text_muted; border: 1px solid $border;
     }
+    QPushButton#danger { color: $danger; border: 1px solid $danger; font-weight: 600; }
+    QPushButton#danger:disabled { color: $text_muted; border: 1px solid $border; }
 
     QLabel#okText { color: $ok; font-weight: 600; }
     QLabel#warnText { color: $warn; font-weight: 600; }

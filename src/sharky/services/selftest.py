@@ -176,12 +176,13 @@ def _check_qt() -> str:
 
 
 def _check_database() -> str:
-    """Esquema, migraciones, una escritura, el libro y la copia de ida y vuelta."""
+    """Esquema, migraciones, una escritura, el libro, la copia de ida y vuelta y borrar la
+    cartera."""
     from sharky.core.ledger import build_ledger
     from sharky.core.models import Asset, Trade, TradeKind
-    from sharky.services.backup import create_backup, restore_backup
+    from sharky.services.backup import create_backup, restore_backup, wipe_portfolio
     from sharky.services.db import TABLES, Database, latest_version
-    from sharky.services.repositories import AssetRepository, TradeRepository
+    from sharky.services.repositories import AssetRepository, TradeRepository, has_portfolio
 
     with tempfile.TemporaryDirectory(
         prefix="sharky_selftest_db_", ignore_cleanup_errors=True
@@ -220,11 +221,15 @@ def _check_database() -> str:
             posicion = libro.position("PRUEBA")
             if posicion is None or posicion.units != Decimal("3"):
                 raise CheckFailure("la copia restaurada no trae lo que se guardó")
+            wipe_portfolio(db, momento, raiz / "backups")
+            if has_portfolio(db.connection()) or db.user_version() != latest_version():
+                raise CheckFailure("borrar la cartera no deja la base de datos vacía y al día")
         finally:
             db.close_all()
     return (
         f"SQLite {sqlite3.sqlite_version}, modo {modo}, esquema {latest_version()} "
-        f"({len(TABLES)} tablas); migrar dos veces, escribir, copiar y restaurar, correctos"
+        f"({len(TABLES)} tablas); migrar dos veces, escribir, copiar, restaurar y borrar la "
+        "cartera, correctos"
     )
 
 

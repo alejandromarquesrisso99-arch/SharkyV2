@@ -17,10 +17,12 @@ from typing import Any
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -37,6 +39,7 @@ from sharky.services.backup import (
     create_backup,
     list_backups,
     restore_backup,
+    wipe_portfolio,
 )
 from sharky.services.db import Database
 from sharky.services.market import FxProvider, PriceProvider
@@ -164,11 +167,73 @@ class PlaceholderPage(QWidget):
         caja.addStretch(1)
 
 
-class DataCard(QFrame):
-    """Ajustes → Datos: copia de seguridad y restauración (H3). El resto llega en H13.
+#: Lo que hay que escribir para confirmar «Borrar cartera».
+WIPE_CONFIRMATION = "BORRAR"
 
-    Las dos acciones tocan el disco, así que corren en segundo plano. Restaurar pide
-    confirmación y, al terminar, pide reiniciar la app con `restartRequested`.
+
+class WipeConfirmDialog(QDialog):
+    """Confirmación de «Borrar cartera»: qué se borra, qué se conserva, cuánto dura la copia
+    previa, y el botón solo se activa tras escribir BORRAR."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Borrar cartera")
+        self.setMinimumWidth(520)
+        caja = QVBoxLayout(self)
+        caja.setContentsMargins(20, 18, 20, 18)
+        caja.setSpacing(10)
+
+        titulo = QLabel("¿Borrar toda la cartera?")
+        titulo.setObjectName("cardTitle")
+        caja.addWidget(titulo)
+
+        aviso = QFrame()
+        aviso.setObjectName("dangerBox")
+        texto_aviso = QVBoxLayout(aviso)
+        texto_aviso.setContentsMargins(14, 10, 14, 10)
+        self.explanation = QLabel(
+            "Se borra todo lo que hay en Sharky: posiciones, operaciones, efectivo, historial "
+            "del patrimonio, tesis, informes, avisos y radar.\n\n"
+            "Se conservan los ajustes, la clave de Claude y las copias de seguridad.\n\n"
+            "Antes se guarda una copia de lo que hay, y con «Restaurar copia…» puedes "
+            f"recuperarla, pero solo durante un tiempo: Sharky guarda las {KEEP_BACKUPS} copias "
+            "más recientes y borra las anteriores, así que con una copia al día dura unas dos "
+            "semanas.\n\n"
+            "Después, Sharky se reinicia y abre el asistente para crear la cartera de nuevo."
+        )
+        self.explanation.setWordWrap(True)
+        texto_aviso.addWidget(self.explanation)
+        caja.addWidget(aviso)
+
+        caja.addWidget(QLabel(f"Para confirmar, escribe {WIPE_CONFIRMATION}:"))
+        self.confirm_edit = QLineEdit()
+        self.confirm_edit.setPlaceholderText(WIPE_CONFIRMATION)
+        self.confirm_edit.textChanged.connect(self._on_text)
+        caja.addWidget(self.confirm_edit)
+
+        botones = QHBoxLayout()
+        botones.addStretch(1)
+        self.cancel_button = QPushButton("Cancelar")
+        self.cancel_button.setDefault(True)
+        self.cancel_button.clicked.connect(self.reject)
+        botones.addWidget(self.cancel_button)
+        self.wipe_button = QPushButton("Borrar cartera")
+        self.wipe_button.setObjectName("danger")
+        self.wipe_button.setEnabled(False)
+        self.wipe_button.clicked.connect(self.accept)
+        botones.addWidget(self.wipe_button)
+        caja.addLayout(botones)
+
+    def _on_text(self, texto: str) -> None:
+        self.wipe_button.setEnabled(texto.strip() == WIPE_CONFIRMATION)
+
+
+class DataCard(QFrame):
+    """Ajustes → Datos: copia de seguridad, restauración (H3) y borrar la cartera. El resto
+    llega en H13.
+
+    Las tres acciones tocan el disco, así que corren en segundo plano. Restaurar y borrar piden
+    confirmación y, al terminar, piden reiniciar la app con `restartRequested`.
     """
 
     restartRequested = Signal()
@@ -201,6 +266,13 @@ class DataCard(QFrame):
         self.restore_button.clicked.connect(self.start_restore)
         fila.addWidget(self.restore_button)
         fila.addStretch(1)
+        self.wipe_button = QPushButton("Borrar cartera…")
+        self.wipe_button.setObjectName("danger")
+        self.wipe_button.setToolTip(
+            "Borra todo y vuelve a abrir el asistente de primer arranque. Antes guarda una copia."
+        )
+        self.wipe_button.clicked.connect(self.start_wipe)
+        fila.addWidget(self.wipe_button)
         caja.addLayout(fila)
 
         self.status_label = muted("")
@@ -222,6 +294,7 @@ class DataCard(QFrame):
     def _set_busy(self, busy: bool, text: str) -> None:
         self.backup_button.setEnabled(not busy)
         self.restore_button.setEnabled(not busy)
+        self.wipe_button.setEnabled(not busy)
         self.status_label.setText(text)
 
     def _run(self, worker: Worker, on_done: Callable[[Any], None]) -> None:
@@ -252,6 +325,20 @@ class DataCard(QFrame):
         self._set_busy(True, "Copia restaurada. Sharky se reinicia…")
         log.info("Restauración terminada: se pide reiniciar Sharky")
         self.notify_restart(resultado)
+        self.restartRequested.emit()
+
+    # -- borrar la cartera -------------------------------------------------------------
+
+    def start_wipe(self) -> None:
+        if not self.confirm_wipe():
+            return
+        self._set_busy(True, "Borrando la cartera…")
+        self._run(Worker(wipe_portfolio, self._db, datetime.now()), self._on_wipe_done)
+
+    def _on_wipe_done(self, seguridad: Path) -> None:
+        self._set_busy(True, "Cartera borrada. Sharky se reinicia…")
+        log.info("Cartera borrada: se pide reiniciar Sharky para abrir el asistente")
+        self.notify_wiped(seguridad)
         self.restartRequested.emit()
 
     def _on_failed(self, mensaje: str) -> None:
@@ -295,6 +382,21 @@ class DataCard(QFrame):
             f"Se han restaurado los datos de {result.restored_from.name}.\n\n"
             f"Lo que había antes está en {result.safety_copy.name}.\n"
             "Sharky se reinicia ahora.",
+        )
+
+    def confirm_wipe(self) -> bool:
+        dialogo = WipeConfirmDialog(self)
+        try:
+            return dialogo.exec() == QDialog.DialogCode.Accepted
+        finally:
+            dialogo.deleteLater()
+
+    def notify_wiped(self, safety_copy: Path) -> None:
+        QMessageBox.information(
+            self,
+            "Cartera borrada",
+            f"Lo que había está en {safety_copy.name}, en la carpeta de copias.\n"
+            "Sharky se reinicia ahora y abre el asistente para crear la cartera.",
         )
 
     def show_error(self, message: str) -> None:

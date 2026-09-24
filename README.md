@@ -139,5 +139,10 @@ cache\          caché del mercado
   nunca en un fichero. Las copias de seguridad no la llevan.
 - Ajustes → Datos: «Copia de seguridad ahora» y «Restaurar copia…». Restaurar pide
   confirmación, guarda antes una copia de lo que hay y reinicia Sharky.
+- «Borrar cartera…» (Ajustes → Datos) es para empezar de cero: borra todo lo de la base de
+  datos y conserva los ajustes, la clave y las copias. Hay que escribir BORRAR para
+  confirmarlo. Antes guarda una copia `sharky-…-antes-de-borrar.db` que se recupera con
+  «Restaurar copia…», pero entra en la rotación de las 14 últimas (con una copia al día, unas
+  dos semanas). Sharky se reinicia y abre el asistente.
 - Si `settings.json` se estropea, Sharky arranca con los valores por defecto y aparta el
   fichero dañado como `settings.danado.json`.

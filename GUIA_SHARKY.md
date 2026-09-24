@@ -146,7 +146,7 @@ Las posiciones no se guardan: se derivan de `trades` con coste medio ponderado (
 
 ### 5.2 Primer arranque
 
-Si no hay cartera en la base de datos, la app abre un asistente en lugar de la ventana principal. No escribe nada hasta confirmar; cancelar deja todo como estaba.
+Si no hay cartera en la base de datos, la app abre un asistente en lugar de la ventana principal. No escribe nada hasta confirmar; cancelar deja todo como estaba. Para empezar de cero, «Borrar cartera…» (Ajustes → Datos, §5.10) vacía la base de datos y el asistente vuelve a salir.
 
 1. **Clave de Claude.** Una línea de presentación (Sharky no opera por ti ni es asesoramiento financiero), campo oculto y «Probar clave» (`models.list`, no gasta tokens; sin conexión, se guarda sin comprobar). Se puede omitir: la app funciona sin IA y lo indica en cada informe.
 2. **Cartera.** «Adjuntar CSV…» con vista previa en tabla; todos los errores a la vez, con su número de línea; «Guardar plantilla CSV…». Debajo: efectivo en EUR y bróker (por defecto, «Trade Republic»). Se puede empezar sin posiciones (solo efectivo).
@@ -324,7 +324,9 @@ Cada paso queda en `runs`; si alguno falla, notificación «Algo no ha ido bien 
 4. **Tesis**: activas y cerradas, editor, historial, propuestas pendientes con «Aplicar» o «Descartar» y «Alta rápida» para poner stop y objetivo a todas las posiciones sin tesis desde una tabla (entrada = coste medio y niveles en EUR por defecto).
 5. **Radar**: alertas activas con sus niveles, ratio y caída desde el máximo, y botones «Comprar» y «Descartar»; historial de alertas caducadas y ejecutadas; candidatos descartados por el filtro con su motivo; lista de vigilancia editable; botón «Buscar oportunidades nuevas» con su precio aproximado.
 6. **Informes**: lista por tipo y fecha (diario, semanal, mensual y exploraciones), lector Markdown (QTextBrowser), marca «Sin IA», coste de cada informe y exportar a `.md`.
-7. **Ajustes**: Claude (clave, probar, borrar, modelo y esfuerzo de cada acción, precios, tope de gasto y gasto del mes), Mandato, Apariencia (tema), Radar (vigencia de las alertas y umbrales del filtro), Automatización (inicio con Windows, día del semanal), Datos (abrir carpeta, copia ahora, copia en otra carpeta, restaurar), Registro de ejecuciones y Acerca de (versión).
+7. **Ajustes**: Claude (clave, probar, borrar, modelo y esfuerzo de cada acción, precios, tope de gasto y gasto del mes), Mandato, Apariencia (tema), Radar (vigencia de las alertas y umbrales del filtro), Automatización (inicio con Windows, día del semanal), Datos (abrir carpeta, copia ahora, copia en otra carpeta, restaurar, borrar cartera), Registro de ejecuciones y Acerca de (versión).
+
+**Borrar cartera** (Ajustes → Datos), para empezar de cero. Un aviso explica que se borra todo lo de la base de datos (posiciones, operaciones, efectivo, historial del NAV, tesis, informes, avisos y radar) y que se conservan los ajustes, la clave de Claude y las copias; el botón solo se activa tras escribir «BORRAR». Antes se guarda una copia `…-antes-de-borrar`, que se recupera con «Restaurar» y entra en la rotación de las 14 últimas: con la copia diaria dura unas dos semanas, y el aviso lo dice. Después, Sharky se reinicia y abre el asistente de primer arranque.
 
 Diseño sobrio: tablas legibles y color solo para estados (verde, ámbar, rojo). Ninguna acción larga congela la ventana: barra de progreso y «Cancelar» cuando sea posible.
 
