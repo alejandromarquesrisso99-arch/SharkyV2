@@ -175,6 +175,17 @@ class AssetRepository(_Repository):
     def list_all(self) -> list[Asset]:
         return self._select(order="ticker")
 
+    def update(self, asset: Asset) -> bool:
+        """Sustituye los datos del activo con ese ticker. Devuelve si existía."""
+        _require_transaction(self.conn)
+        columnas = [c for c in _columns(Asset, with_id=False) if c != "ticker"]
+        asignaciones = ", ".join(f'"{c}" = ?' for c in columnas)
+        valores = [to_db(getattr(asset, c)) for c in columnas]
+        cursor = self.conn.execute(
+            f"UPDATE assets SET {asignaciones} WHERE ticker = ?", [*valores, asset.ticker]
+        )
+        return cursor.rowcount > 0
+
 
 class TradeRepository(_Repository):
     table, record = "trades", Trade
@@ -215,11 +226,24 @@ class PriceRepository(_Repository):
         _insert(self.conn, self.table, price, verb="INSERT OR REPLACE")
 
     def latest(self, ticker: str) -> Price | None:
-        filas = self._select("ticker = ?", (ticker,), order="price_date DESC")
+        filas = self._select("ticker = ?", (ticker,), order="price_date DESC, fetched_at DESC")
         return filas[0] if filas else None
+
+    def latest_all(self) -> dict[str, Price]:
+        """El último precio de cada ticker."""
+        ultimos: dict[str, Price] = {}
+        for precio in self._select(order="ticker, price_date DESC, fetched_at DESC"):
+            ultimos.setdefault(precio.ticker, precio)
+        return ultimos
 
     def list_for(self, ticker: str) -> list[Price]:
         return self._select("ticker = ?", (ticker,), order="price_date")
+
+    def delete_for(self, ticker: str) -> int:
+        """Borra los precios guardados de un ticker (por ejemplo, al cambiarle el símbolo:
+        eran de otro valor). Devuelve cuántos había."""
+        _require_transaction(self.conn)
+        return self.conn.execute("DELETE FROM prices WHERE ticker = ?", (ticker,)).rowcount
 
 
 class FxRateRepository(_Repository):
@@ -229,8 +253,17 @@ class FxRateRepository(_Repository):
         _insert(self.conn, self.table, rate, verb="INSERT OR REPLACE")
 
     def latest(self, currency: str) -> FxRate | None:
-        filas = self._select("currency = ?", (currency,), order="rate_date DESC")
+        filas = self._select(
+            "currency = ?", (currency,), order="rate_date DESC, fetched_at DESC"
+        )
         return filas[0] if filas else None
+
+    def latest_all(self) -> dict[str, FxRate]:
+        """El último cambio de cada divisa."""
+        ultimos: dict[str, FxRate] = {}
+        for cambio in self._select(order="currency, rate_date DESC, fetched_at DESC"):
+            ultimos.setdefault(cambio.currency, cambio)
+        return ultimos
 
 
 class NavSnapshotRepository(_Repository):

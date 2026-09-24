@@ -1,8 +1,8 @@
 """Las siete secciones de la ventana (GUIA §5.10).
 
-En H1 están vacías a propósito: cada una dice qué vivirá en ella y en qué hito llega. La
-única que ya hace algo es Ajustes, con Apariencia (el tema), Datos (copia de seguridad y
-restauración, H3) y Acerca de (la versión).
+Las que todavía no tienen su hito están vacías a propósito: cada una dice qué vivirá en ella y
+en qué hito llega. Ya funcionan Cartera (H5, en ui/portfolio.py) y Ajustes, con Apariencia (el
+tema), Datos (copia de seguridad y restauración, H3) y Acerca de (la versión).
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ from sharky.services.backup import (
     restore_backup,
 )
 from sharky.services.db import Database
+from sharky.services.market import FxProvider, PriceProvider
+from sharky.services.settings import Settings
 from sharky.ui.theme import THEME_LABELS, Theme, ThemeController
 from sharky.ui.workers import Worker, start
 
@@ -125,6 +127,24 @@ def muted(text: str) -> QLabel:
     etiqueta.setObjectName("muted")
     etiqueta.setWordWrap(True)
     return etiqueta
+
+
+def state_label(text: str = "", state: str = "muted") -> QLabel:
+    """Una línea de estado. `state`: muted, okText, warnText o dangerText (color del tema)."""
+    etiqueta = QLabel(text)
+    etiqueta.setObjectName(state)
+    etiqueta.setWordWrap(True)
+    return etiqueta
+
+
+def set_state(label: QLabel, text: str, state: str) -> None:
+    """Cambia el texto y el estado de una línea; sin texto, se oculta."""
+    label.setText(text)
+    if label.objectName() != state:
+        label.setObjectName(state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+    label.setVisible(bool(text))
 
 
 class PlaceholderPage(QWidget):
@@ -373,8 +393,18 @@ def build_page(
     theme: ThemeController,
     version: str,
     db: Database | None = None,
+    *,
+    market: PriceProvider | None = None,
+    fx: FxProvider | None = None,
+    settings: Settings | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> QWidget:
-    """La página de una sección."""
+    """La página de una sección. Cartera necesita la base de datos y el mercado."""
     if section.key == "ajustes":
         return SettingsPage(section, theme, version, db=db)
+    if section.key == "cartera" and db is not None and market is not None and fx is not None:
+        from sharky.ui.portfolio import PortfolioPage  # portfolio usa las piezas de aquí
+
+        extra = {"now": now} if now is not None else {}
+        return PortfolioPage(db, theme, market, fx, settings=settings, **extra)
     return PlaceholderPage(section)

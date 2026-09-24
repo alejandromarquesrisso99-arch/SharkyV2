@@ -2,10 +2,11 @@
 
 Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, la base de
 datos (esquema, migraciones, copia y restauración), los ajustes, la plantilla CSV del asistente,
-el Administrador de credenciales, las bibliotecas de mercado e IA y los recursos del paquete.
-Todo lo que escribe
-va a una carpeta temporal: nunca toca los datos del usuario ni su clave.
-Con `--online` añade una cotización real y una conexión TLS con la API de Claude.
+los precios y la valoración (con un Yahoo simulado), el Administrador de credenciales, las
+bibliotecas de mercado e IA y los recursos del paquete. Todo lo que escribe va a una carpeta
+temporal: nunca toca los datos del usuario ni su clave.
+Con `--online` añade una cotización real con su tipo de cambio y una conexión TLS con la API
+de Claude.
 
 Distingue dos cosas que no se parecen en nada:
 
@@ -29,7 +30,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -292,6 +293,113 @@ def _check_csv_template() -> str:
     )
 
 
+def _check_market() -> str:
+    """H5: precios y valoración sin red. Un yfinance simulado (con pandas, como el de verdad)
+    da precios en EUR, USD y GBp; se guardan en una base de datos temporal y se valoran con sus
+    procedencias. También comprueba que la caché de yfinance se deja configurar."""
+    import pandas
+
+    from sharky.core.formatting import format_pct
+    from sharky.core.models import (
+        Asset,
+        CashKind,
+        CashMovement,
+        PriceSource,
+        Trade,
+        TradeKind,
+    )
+    from sharky.services.db import Database
+    from sharky.services.market import (
+        YahooMarket,
+        configure_yfinance,
+        load_valuation,
+        refresh_market,
+    )
+    from sharky.services.repositories import (
+        AssetRepository,
+        CashMovementRepository,
+        TradeRepository,
+    )
+
+    cierres = {
+        "SAN.MC": (5.12, "EUR"),
+        "AAPL": (215.4, "USD"),
+        "VOD.L": (125.30000305175781, "GBp"),
+        "USDEUR=X": (0.85, "EUR"),
+        "GBPEUR=X": (1.16, "EUR"),
+    }
+
+    class TickerSimulado:
+        def __init__(self, symbol: str) -> None:
+            self.symbol = symbol
+            self.history_metadata: dict[str, str] = {}
+
+        def history(self, **_kwargs: object) -> pandas.DataFrame:
+            if self.symbol not in cierres:
+                return pandas.DataFrame()
+            valor, divisa = cierres[self.symbol]
+            self.history_metadata = {"currency": divisa}
+            indice = pandas.DatetimeIndex([pandas.Timestamp("2026-01-02")])
+            return pandas.DataFrame({"Close": [valor]}, index=indice.tz_localize("Europe/Madrid"))
+
+    dia = date(2026, 1, 2)
+    ahora = datetime(2026, 1, 2, 18, 0, tzinfo=UTC)
+    uno = Decimal("1")
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_market_", ignore_cleanup_errors=True
+    ) as carpeta:
+        raiz = Path(carpeta)
+        try:
+            cache = configure_yfinance(raiz / "cache")
+            if not cache.is_dir():
+                raise CheckFailure("no se ha podido crear la caché de yfinance")
+        finally:
+            configure_yfinance()  # suelta la carpeta temporal
+        db = Database(raiz / "sharky.db")
+        try:
+            db.migrate()
+            with db.transaction() as conn:
+                for ticker, divisa, simbolo in (
+                    ("SAN", "EUR", "SAN.MC"),
+                    ("AAPL", "USD", "AAPL"),
+                    ("VOD", "GBp", "VOD.L"),
+                    ("SINSIMBOLO", "EUR", None),
+                ):
+                    AssetRepository(conn).add(Asset(ticker, ticker, divisa, yahoo_symbol=simbolo))
+                    TradeRepository(conn).add(
+                        Trade(dia, ticker, TradeKind.OPENING, Decimal("10"), uno, "EUR", uno,
+                              Decimal("0"), Decimal("10"))
+                    )
+                CashMovementRepository(conn).add(
+                    CashMovement(dia, CashKind.INITIAL, Decimal("100"))
+                )
+            mercado = YahooMarket(
+                ticker_factory=TickerSimulado,
+                search_factory=lambda *_a, **_k: None,
+                sleep=lambda _s: None,
+            )
+            refresco = refresh_market(db, mercado, mercado, ahora)
+            valoracion = load_valuation(db.connection(), ahora, refresco.fetched_at)
+        finally:
+            db.close_all()
+
+    esperado = {
+        "SAN": (Decimal("51.2"), PriceSource.MARKET),
+        "AAPL": (Decimal("1830.9"), PriceSource.MARKET),  # 10 × 215,4 × 0,85
+        "VOD": (Decimal("14.5348"), PriceSource.MARKET),  # 10 × 125,3 × 1,16 / 100
+        "SINSIMBOLO": (Decimal("10"), PriceSource.COST),
+    }
+    for ticker, (valor, origen) in esperado.items():
+        posicion = valoracion.position(ticker)
+        if posicion is None or posicion.value_eur != valor or posicion.source is not origen:
+            obtenido = (posicion.value_eur, posicion.source) if posicion else None
+            raise CheckFailure(f"{ticker} se valora mal: {obtenido}, se esperaba {valor, origen}")
+    return (
+        f"Yahoo simulado: EUR, USD y GBp a mercado y un activo sin símbolo a coste; cobertura "
+        f"{format_pct(valoracion.coverage)}; caché de yfinance configurable"
+    )
+
+
 def configure_keyring() -> str:
     """Fija el backend de Windows en código: dentro del exe no se descubre solo (GUIA §3)."""
     return secret_store.configure_backend()
@@ -340,16 +448,36 @@ def _check_resources() -> str:
 
 
 def _check_quote() -> str:
-    import yfinance
+    """Una cotización real y su tipo de cambio, por el mismo camino que «Actualizar precios»
+    (lotes, divisa real, par XXXEUR=X). La caché de yfinance va a una carpeta temporal."""
+    from sharky.core.formatting import format_price
+    from sharky.core.valuation import fx_currency
+    from sharky.services.market import YahooMarket, configure_yfinance
 
-    try:
-        datos = yfinance.Ticker(ONLINE_TICKER).history(period="5d", auto_adjust=False)
-    except Exception as error:  # la red o Yahoo, no el programa
-        raise CheckWarning(f"Yahoo no ha respondido: {type(error).__name__}: {error}") from error
-    if datos is None or datos.empty:
-        raise CheckWarning("Yahoo no ha devuelto cotizaciones en este momento")
-    cierre = float(datos["Close"].iloc[-1])
-    return f"{ONLINE_TICKER}: último cierre {cierre:.2f} (no se guarda nada)"
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_yf_", ignore_cleanup_errors=True
+    ) as carpeta:
+        try:
+            mercado = YahooMarket(cache_dir=Path(carpeta), sleep=lambda _s: None)
+            precios = mercado.fetch_quotes([ONLINE_TICKER])
+            cita = precios.quotes.get(ONLINE_TICKER)
+            if cita is None:
+                fallo = precios.failures.get(ONLINE_TICKER)
+                motivo = fallo.message if fallo else "sin respuesta"
+                raise CheckWarning(f"Yahoo no ha dado {ONLINE_TICKER}: {motivo}")
+            base = fx_currency(cita.currency)
+            cambio = mercado.fetch_fx([base]).rates.get(base) if base else None
+            if base and cambio is None:
+                raise CheckWarning(f"Yahoo no ha dado el cambio {base}→EUR")
+        finally:
+            configure_yfinance()  # suelta la carpeta temporal
+    texto = (
+        f"{ONLINE_TICKER}: {format_price(cita.price)} {cita.currency}, cierre del "
+        f"{cita.close_date:%d/%m/%Y}"
+    )
+    if cambio is not None:
+        texto += f"; {base}→EUR {format_price(cambio.rate_to_eur)}"
+    return texto + " (no se guarda nada)"
 
 
 def _check_anthropic_tls() -> str:
@@ -383,6 +511,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Base de datos", _check_database),
         Check("Ajustes", _check_settings),
         Check("Plantilla CSV y cartera inicial", _check_csv_template),
+        Check("Precios y valoración", _check_market),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

@@ -113,3 +113,16 @@ def test_la_hoja_de_estilo_usa_todos_los_tokens_del_tema(qapp):
     hoja = theme.build_stylesheet(theme.DARK_TOKENS)
     assert "$" not in hoja  # no ha quedado ningún hueco sin sustituir
     assert hoja.strip()
+
+
+@pytest.mark.parametrize("tema", [Theme.LIGHT, Theme.DARK])
+@pytest.mark.parametrize("estado", ["ok", "warn", "danger"])
+def test_las_etiquetas_de_estado_contrastan_con_su_fondo(tema, estado):
+    """«Mercado», «Coste»…: el texto de color sobre su fondo teñido sigue siendo legible."""
+    texto, fondo, _borde = theme.chip_tokens(tema, estado)
+    assert contraste(texto, fondo) >= CONTRASTE_MINIMO
+
+
+def test_mezclar_colores():
+    assert theme.mix("#000000", "#FFFFFF", 0.5) == "#808080"
+    assert theme.mix("#123456", "#FFFFFF", 0) == "#123456"

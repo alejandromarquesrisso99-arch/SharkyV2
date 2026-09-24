@@ -189,12 +189,17 @@ class Price:
 
 @dataclass(frozen=True)
 class FxRate:
-    """Tabla `fx_rates`: cuántos EUR vale una unidad de la divisa ese día."""
+    """Tabla `fx_rates`: cuántos EUR vale una unidad de la divisa ese día.
+
+    `fetched_at` es cuándo se descargó (migración 2); en los cambios guardados antes de
+    existir la columna vale None y cuentan como antiguos.
+    """
 
     currency: str
     rate_date: date
     rate_to_eur: Decimal
     source: PriceSource
+    fetched_at: datetime | None = None
 
 
 @dataclass(frozen=True)

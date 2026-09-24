@@ -23,6 +23,8 @@ class WorkerSignals(QObject):
     finished = Signal(object)
     #: El error, con un mensaje que se puede enseñar.
     failed = Signal(str)
+    #: Avance: hechos y total (solo si se ha pedido con `pass_progress`).
+    progress = Signal(int, int)
 
 
 class Worker(QRunnable):
@@ -34,6 +36,12 @@ class Worker(QRunnable):
         self.args = args
         self.kwargs = kwargs
         self.signals = WorkerSignals()
+
+    def pass_progress(self, keyword: str = "progress") -> Worker:
+        """La función recibirá en `keyword` una función `(hechos, total)` que emite
+        `signals.progress`; la señal llega al hilo de la interfaz."""
+        self.kwargs[keyword] = self.signals.progress.emit
+        return self
 
     def run(self) -> None:
         try:

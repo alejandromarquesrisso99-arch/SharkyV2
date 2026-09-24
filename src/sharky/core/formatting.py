@@ -51,6 +51,33 @@ def format_price(value: Decimal) -> str:
     return _spanish(value, PRICE_MAX_DECIMALS, trim=True, min_decimals=PRICE_MIN_DECIMALS)
 
 
+#: Signo menos tipográfico, para las cifras que llevan signo siempre («+3,2 %», «−4,1 %»).
+MINUS = "−"
+
+
+def _signed(value: Decimal, decimals: int) -> tuple[str, str]:
+    """El signo («+», «−» o nada si redondea a cero) y la cifra sin él."""
+    redondeado = value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+    signo = "+" if redondeado > 0 else MINUS if redondeado < 0 else ""
+    return signo, _spanish(abs(redondeado), decimals, trim=False)
+
+
+def format_pct(fraction: Decimal, decimals: int = 1, *, signed: bool = False) -> str:
+    """Una proporción como porcentaje: `Decimal("0.123")` → «12,3 %». Con `signed`, el signo
+    va siempre delante: «+32,7 %», «−4,1 %» (y «0,0 %» si redondea a cero)."""
+    porcentaje = fraction * 100
+    if not signed:
+        return f"{_spanish(porcentaje, decimals, trim=False)} %"
+    signo, cifra = _signed(porcentaje, decimals)
+    return f"{signo}{cifra} %"
+
+
+def format_signed_amount(value: Decimal) -> str:
+    """Importe con dos decimales y el signo siempre delante: «+1.234,56», «−12,00»."""
+    signo, cifra = _signed(value, 2)
+    return f"{signo}{cifra}"
+
+
 def parse_decimal(text: str) -> Decimal:
     """Un número escrito a mano o leído de un CSV, con coma o punto decimal.
 

@@ -260,9 +260,17 @@ CREATE TABLE runs (
 CREATE INDEX runs_by_start ON runs (started_at);
 """
 
+# H5: la regla CACHE («guardado hace menos de 24 h», GUIA §5.3) también vale para el tipo de
+# cambio, así que hace falta saber cuándo se descargó, igual que en `prices`. Los cambios de
+# antes quedan sin hora y cuentan como antiguos.
+_V2_FX_FETCHED_AT = """
+ALTER TABLE fx_rates ADD COLUMN fetched_at TEXT;
+"""
+
 #: Todas las migraciones, en orden. Las nuevas se añaden al final y nunca se editan.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "Esquema inicial: las tablas de GUIA §5.1", _V1_SCHEMA),
+    Migration(2, "Hora de descarga de los tipos de cambio", _V2_FX_FETCHED_AT),
 )
 
 #: Las tablas que tiene que tener cualquier base de datos de Sharky.

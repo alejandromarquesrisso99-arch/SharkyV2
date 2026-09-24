@@ -154,12 +154,26 @@ _STYLESHEET = Template(
         border-radius: 6px; padding: 6px 8px;
     }
     QLineEdit:focus { border: 1px solid $accent; }
-    QTableWidget {
+    QTableView {
         background-color: $surface; color: $text; border: none; gridline-color: $border;
+        selection-background-color: $surface_selected; selection-color: $text;
+    }
+    QProgressBar {
+        background-color: $surface_alt; color: $text; border: 1px solid $border;
+        border-radius: 4px; text-align: center; max-height: 14px;
+    }
+    QProgressBar::chunk { background-color: $accent; border-radius: 3px; }
+    QComboBox {
+        background-color: $surface; color: $text; border: 1px solid $border;
+        border-radius: 6px; padding: 5px 8px;
+    }
+    QComboBox QAbstractItemView {
+        background-color: $surface; color: $text;
+        selection-background-color: $surface_selected; selection-color: $text;
     }
     QHeaderView::section {
         background-color: $surface; color: $text_muted; border: none;
-        border-bottom: 1px solid $border; padding: 6px 8px; font-weight: 600;
+        border-bottom: 1px solid $border; padding: 6px 18px 6px 8px; font-weight: 600;
     }
 
     QScrollArea { background-color: transparent; border: none; }
@@ -179,6 +193,42 @@ def tokens(theme: Theme) -> dict[str, str]:
 def color(theme: Theme, token: str) -> QColor:
     """Un color del tema, para lo que no se pueda pintar con la hoja de estilo."""
     return QColor(tokens(theme)[token])
+
+
+def mix(base: str, other: str, amount: float) -> str:
+    """El color `base` con un `amount` (0 a 1) de `other` por encima, en «#RRGGBB»."""
+    uno, otro = QColor(base), QColor(other)
+    canales = (
+        round(a + (b - a) * amount)
+        for a, b in (
+            (uno.red(), otro.red()),
+            (uno.green(), otro.green()),
+            (uno.blue(), otro.blue()),
+        )
+    )
+    return "#" + "".join(f"{c:02X}" for c in canales)
+
+
+#: Cuánto del color de estado lleva el fondo y el borde de una etiqueta de estado.
+CHIP_FILL = 0.12
+CHIP_BORDER = 0.35
+
+
+def chip_tokens(theme: Theme, token: str) -> tuple[str, str, str]:
+    """Texto, fondo y borde de una etiqueta de estado (Mercado, Coste…) con el color `token`
+    (ok, warn o danger) sobre una tarjeta."""
+    t = tokens(theme)
+    return (
+        t[token],
+        mix(t["surface"], t[token], CHIP_FILL),
+        mix(t["surface"], t[token], CHIP_BORDER),
+    )
+
+
+def chip_colors(theme: Theme, token: str) -> tuple[QColor, QColor, QColor]:
+    """Lo mismo que `chip_tokens`, como colores de Qt para pintar."""
+    texto, fondo, borde = chip_tokens(theme, token)
+    return QColor(texto), QColor(fondo), QColor(borde)
 
 
 def system_theme() -> Theme:

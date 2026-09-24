@@ -42,6 +42,7 @@ from sharky.core.models import (
     Trade,
     TradeKind,
 )
+from sharky.core.valuation import BASE_CURRENCY, RELIABLE_COVERAGE, normalize_currency
 
 #: La plantilla del Apéndice A. Se genera desde aquí, así `*.csv` se ignora en git sin
 #: excepciones.
@@ -70,16 +71,11 @@ MIN_COLUMNS = 6
 #: Un CSV de posiciones ocupa unos pocos KB. Algo mayor es otro fichero elegido por error.
 MAX_BYTES = 1_000_000
 
-BASE_CURRENCY = "EUR"
-PENCE = "GBp"
 OPENING_REASON = "Posición inicial importada del CSV"
 INITIAL_UNIT_VALUE = Decimal("100")
-#: Una valoración es fiable con una cobertura del 90 % o más (GUIA §5.4).
-RELIABLE_COVERAGE = Decimal("0.90")
 
 _TICKER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ISIN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
-_CURRENCY = re.compile(r"^[A-Za-z]{3}$")
 _DELIMITERS: tuple[str, ...] = (";", "\t", ",")
 _DELIMITER_NAMES = {";": "punto y coma", "\t": "tabulador", ",": "coma"}
 
@@ -424,20 +420,6 @@ def _positive(
         error(no_positivo)
         return None
     return valor
-
-
-def normalize_currency(texto: str) -> str | None:
-    """Divisa de cotización: 3 letras en mayúsculas, salvo los peniques de Londres.
-
-    `GBX` (en cualquier forma) y `GBp` se guardan como `GBp`; `GBP` son libras y se quedan
-    igual. Devuelve None si no son 3 letras.
-    """
-    limpio = texto.strip()
-    if not _CURRENCY.match(limpio):
-        return None
-    if limpio == PENCE or limpio.upper() == "GBX":
-        return PENCE
-    return limpio.upper()
 
 
 def _asset_class(texto: str) -> AssetClass | None:

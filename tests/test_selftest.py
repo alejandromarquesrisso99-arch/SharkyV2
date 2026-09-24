@@ -1,5 +1,7 @@
 """La autocomprobación: sin red, sin clave y sin tocar el Administrador de credenciales."""
 
+from datetime import date
+
 from sharky.services import selftest
 from sharky.services.selftest import (
     Check,
@@ -118,3 +120,57 @@ def test_la_autocomprobacion_no_toca_los_datos_del_usuario(carpeta_de_datos):
     assert not (carpeta_de_datos / "sharky.db").exists()
     assert not (carpeta_de_datos / "settings.json").exists()
     assert not (carpeta_de_datos / "backups").exists()
+
+
+def test_la_autocomprobacion_revisa_los_precios_y_la_valoracion():
+    comprobacion = next(c for c in build_checks(online=False) if c.name == "Precios y valoración")
+    informe = run_selftest(checks=[comprobacion])
+    resultado = informe.results[0]
+    assert resultado.status is Status.OK, resultado.detail
+    assert "EUR, USD y GBp" in resultado.detail
+
+
+def test_la_cotizacion_real_va_por_el_mismo_camino_que_actualizar_precios(monkeypatch):
+    """Con un yfinance falso: el símbolo, su divisa y el cambio a EUR, sin red."""
+    import yfinance
+
+    from fakes import FakeYahoo
+
+    yahoo = FakeYahoo({
+        selftest.ONLINE_TICKER: ([(date(2026, 9, 24), 512.3)], "USD", "Microsoft"),
+        "USDEUR=X": ([(date(2026, 9, 24), 0.85)], "EUR", "USD/EUR"),
+    })
+    monkeypatch.setattr(yfinance, "Ticker", yahoo.ticker)
+    monkeypatch.setattr(yfinance, "Search", yahoo.search)
+    comprobacion = next(c for c in build_checks(online=True) if c.name == "Cotización real")
+    resultado = run_selftest(checks=[comprobacion]).results[0]
+    assert resultado.status is Status.OK, resultado.detail
+    assert "512,30 USD" in resultado.detail
+    assert "USD→EUR 0,85" in resultado.detail
+
+
+def test_sin_red_la_cotizacion_real_es_un_aviso(monkeypatch):
+    import yfinance
+
+    from fakes import FakeYahoo
+
+    yahoo = FakeYahoo(errors={selftest.ONLINE_TICKER: [ConnectionError("sin red")]})
+    monkeypatch.setattr(yfinance, "Ticker", yahoo.ticker)
+    monkeypatch.setattr(yfinance, "Search", yahoo.search)
+    comprobacion = next(c for c in build_checks(online=True) if c.name == "Cotización real")
+    resultado = run_selftest(checks=[comprobacion]).results[0]
+    assert resultado.status is Status.WARNING
+    assert "conectar" in resultado.detail
+
+
+def test_la_comprobacion_de_la_interfaz_recorre_la_cartera(qapp):
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    from sharky import app
+
+    detalle = app._check_ui()
+    # En el exe el proceso acaba aquí. En pytest sigue: que el asistente y la ventana que
+    # quedan pendientes de borrar se borren ya (un QWizard vivo con Fusion revienta al
+    # cambiar después la hoja de estilo: fallo de Qt 6.11).
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert "Cartera" in detalle

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIcon
@@ -21,6 +23,8 @@ from PySide6.QtWidgets import (
 
 from sharky import paths
 from sharky.services.db import Database
+from sharky.services.market import FxProvider, PriceProvider
+from sharky.services.settings import Settings
 from sharky.ui.pages import SECTIONS, Section, SettingsPage, build_page
 from sharky.ui.theme import Theme, ThemeController
 
@@ -42,13 +46,23 @@ class MainWindow(QMainWindow):
         parent: QWidget | None = None,
         *,
         db: Database | None = None,
+        market: PriceProvider | None = None,
+        fx: FxProvider | None = None,
+        settings: Settings | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         super().__init__(parent)
         self._theme = theme
         self._version = version
         self._db = db
+        self._market = market
+        self._fx = fx
+        self._settings = settings
+        self._now = now
         self._buttons: dict[str, QToolButton] = {}
         self._pages: dict[str, QWidget] = {}
+        #: Botones propios de cada sección, en la cabecera junto al del tema.
+        self._actions: dict[str, QWidget] = {}
 
         self.setWindowIcon(QIcon(str(paths.icon_path())))
         self.setMinimumSize(1040, 680)
@@ -161,16 +175,30 @@ class MainWindow(QMainWindow):
         self._theme_button = QPushButton()
         self._theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._theme_button.clicked.connect(self._theme.toggle)
-        cabecera.addWidget(self._theme_button)
-        caja.addLayout(cabecera)
 
         self._stack = QStackedWidget()
         for seccion in SECTIONS:
-            pagina = build_page(seccion, self._theme, self._version, self._db)
+            pagina = build_page(
+                seccion,
+                self._theme,
+                self._version,
+                self._db,
+                market=self._market,
+                fx=self._fx,
+                settings=self._settings,
+                now=self._now,
+            )
             if isinstance(pagina, SettingsPage):
                 pagina.restartRequested.connect(self.restartRequested)
+            acciones = getattr(pagina, "header_actions", None)
+            if isinstance(acciones, QWidget):
+                acciones.setVisible(False)
+                cabecera.addWidget(acciones)
+                self._actions[seccion.key] = acciones
             self._pages[seccion.key] = pagina
             self._stack.addWidget(pagina)
+        cabecera.addWidget(self._theme_button)
+        caja.addLayout(cabecera)
         caja.addWidget(self._stack, 1)
         return contenido
 
@@ -182,6 +210,8 @@ class MainWindow(QMainWindow):
             raise KeyError(f"Sección desconocida: {key}")
         seccion = next(s for s in SECTIONS if s.key == key)
         self._stack.setCurrentWidget(self._pages[key])
+        for clave, acciones in self._actions.items():
+            acciones.setVisible(clave == key)
         self._buttons[key].setChecked(True)
         self._title_label.setText(seccion.label)
         self.setWindowTitle(f"Sharky — {seccion.label}")
@@ -190,6 +220,17 @@ class MainWindow(QMainWindow):
     def current_section(self) -> str:
         """Clave de la sección que se está viendo."""
         return next(clave for clave, p in self._pages.items() if p is self._stack.currentWidget())
+
+    def page(self, key: str) -> QWidget:
+        """La página de una sección."""
+        return self._pages[key]
+
+    def shutdown(self) -> None:
+        """Al salir: que las páginas corten lo que tengan a medias en segundo plano."""
+        for pagina in self._pages.values():
+            parar = getattr(pagina, "shutdown", None)
+            if callable(parar):
+                parar()
 
     def bring_to_front(self) -> None:
         """Trae la ventana al frente (segunda ejecución del programa o icono de la bandeja)."""

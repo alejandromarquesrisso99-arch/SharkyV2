@@ -69,6 +69,8 @@ from sharky.services.db import Database
 from sharky.services.repositories import create_portfolio
 from sharky.services.settings import DEFAULT_BROKER, Settings, SettingsStore
 from sharky.ui.pages import muted
+from sharky.ui.pages import set_state as _set_state
+from sharky.ui.pages import state_label as _state_label
 from sharky.ui.workers import Worker, start
 
 log = logging.getLogger(__name__)
@@ -149,23 +151,6 @@ def apply_setup(
 
 def _documents_dir() -> str:
     return QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
-
-
-def _state_label(text: str = "", state: str = "muted") -> QLabel:
-    """Una línea de estado. `state`: muted, okText, warnText o dangerText (color del tema)."""
-    etiqueta = QLabel(text)
-    etiqueta.setObjectName(state)
-    etiqueta.setWordWrap(True)
-    return etiqueta
-
-
-def _set_state(label: QLabel, text: str, state: str) -> None:
-    label.setText(text)
-    if label.objectName() != state:
-        label.setObjectName(state)
-        label.style().unpolish(label)
-        label.style().polish(label)
-    label.setVisible(bool(text))
 
 
 class StepBar(QWidget):

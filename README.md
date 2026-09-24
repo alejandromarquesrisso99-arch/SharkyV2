@@ -11,11 +11,12 @@ La especificación completa y única del proyecto es [GUIA_SHARKY.md](GUIA_SHARK
 
 ## Estado
 
-En construcción. Último hito cerrado: **H4 — Asistente de primer arranque** (clave de Claude,
-cartera desde un CSV con vista previa y coste medio editable, efectivo, bróker y creación de la
-cartera en una sola transacción). Antes: base de datos con migraciones, libro derivado de las
-operaciones, ajustes, clave en el Administrador de credenciales, copias de seguridad, ventana
-con las siete secciones, temas claro y oscuro, autocomprobación, ejecutable, instalador y CI.
+En construcción. Último hito cerrado: **H5 — Precios y Cartera** (precios reales de Yahoo
+Finance por lotes y con reintentos, tipos de cambio a euros, procedencia de cada precio,
+cobertura, pantalla Cartera con la exposición por sector y «Editar activo»). Antes: asistente
+de primer arranque, base de datos con migraciones, libro derivado de las operaciones, ajustes,
+clave en el Administrador de credenciales, copias de seguridad, ventana con las siete
+secciones, temas claro y oscuro, autocomprobación, ejecutable, instalador y CI.
 
 ## Primer arranque
 
@@ -31,6 +32,33 @@ Nada se escribe hasta «Crear cartera»; cancelar no deja rastro. El CSV lleva, 
 `ticker;nombre;isin;unidades;coste_medio_eur;divisa;sector;simbolo;clase` (separador `;`, `,`
 o tabulador, decimal con coma o punto, cabecera opcional, UTF-8 o ANSI de Excel). La plantilla
 la genera el propio asistente.
+
+## Cartera y precios
+
+«Actualizar precios (gratis)» descarga el último cierre de cada posición (Yahoo Finance, en
+lotes de 10 y hasta 3 reintentos si Yahoo limita) y los tipos de cambio a euros (`USDEUR=X`…;
+las acciones de Londres cotizan en peniques, `GBp`, y valen la centésima parte de una libra).
+Va en segundo plano, con barra de progreso y «Cancelar»: la ventana no se congela. No llama a
+Claude.
+
+Cada precio lleva su procedencia, y solo las dos primeras son fiables:
+
+| Procedencia | Qué es |
+| :--- | :--- |
+| Mercado | Descargado en la última actualización |
+| Caché | Guardado hace menos de 24 horas |
+| Antiguo | El último conocido, más viejo |
+| Coste | Nunca se obtuvo precio (por ejemplo, sin símbolo): se usa el coste medio |
+
+Una posición es tan fiable como lo menos fiable entre su precio y su tipo de cambio. La
+**cobertura** es la parte del patrimonio con valor fiable (el efectivo cuenta como fiable) y
+se enseña siempre; por debajo del 90 %, la valoración no es fiable. Sin red, Sharky trabaja
+con lo guardado y lo dice. Si Yahoo dice que un activo cotiza en otra divisa que la
+declarada, manda Yahoo: se corrige y se avisa.
+
+«Editar activo» cambia el símbolo de Yahoo (con «Probar», que enseña su último cierre, y
+«Sugerir por ISIN»), el sector y la clase. Al cambiar el símbolo se borran los precios
+guardados de ese activo, porque eran de otro valor.
 
 ## Requisitos de desarrollo
 

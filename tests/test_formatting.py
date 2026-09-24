@@ -7,7 +7,9 @@ import pytest
 from sharky.core.formatting import (
     format_amount,
     format_eur,
+    format_pct,
     format_price,
+    format_signed_amount,
     format_units,
     parse_decimal,
 )
@@ -78,3 +80,34 @@ def test_numeros_con_coma_o_punto(texto, valor):
 def test_lo_que_no_es_un_numero(texto):
     with pytest.raises(ValueError):
         parse_decimal(texto)
+
+
+@pytest.mark.parametrize(
+    ("valor", "texto"),
+    [("0.123", "12,3 %"), ("0.1", "10,0 %"), ("1", "100,0 %"), ("0", "0,0 %"),
+     ("0.12345", "12,3 %"), ("0.00049", "0,0 %"), ("-0.041", "-4,1 %")],
+)
+def test_porcentajes(valor, texto):
+    assert format_pct(D(valor)) == texto
+
+
+@pytest.mark.parametrize(
+    ("valor", "texto"),
+    [("0.327", "+32,7 %"), ("-0.041", "−4,1 %"), ("0", "0,0 %"), ("-0.0004", "0,0 %"),
+     ("0.0005", "+0,1 %")],
+)
+def test_porcentajes_con_signo(valor, texto):
+    assert format_pct(D(valor), signed=True) == texto
+
+
+def test_porcentaje_sin_decimales():
+    assert format_pct(D("0.25"), 0) == "25 %"
+
+
+@pytest.mark.parametrize(
+    ("valor", "texto"),
+    [("124", "+124,00"), ("-66", "−66,00"), ("1234.567", "+1.234,57"), ("0.004", "0,00"),
+     ("-0.004", "0,00")],
+)
+def test_importes_con_signo(valor, texto):
+    assert format_signed_amount(D(valor)) == texto

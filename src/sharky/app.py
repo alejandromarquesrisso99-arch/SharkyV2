@@ -32,6 +32,9 @@ log = logging.getLogger(__name__)
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUPS = 5
 LOG_FORMAT = "%(asctime)s  %(levelname)-8s %(name)s: %(message)s"
+#: Al salir, cuánto se espera a que termine lo que va en segundo plano (una descarga cancelada
+#: acaba en cuanto vuelve la petición en curso).
+SHUTDOWN_WAIT_MS = 20_000
 
 
 def ensure_std_streams() -> None:
@@ -227,9 +230,15 @@ def _check_ui() -> str:
     from PySide6.QtWidgets import QApplication
 
     from sharky.services.db import Database
+    from sharky.services.market import YahooMarket
+    from sharky.services.selftest import CheckFailure
     from sharky.ui.main_window import MainWindow
     from sharky.ui.pages import SECTIONS
+    from sharky.ui.portfolio import PortfolioPage
     from sharky.ui.theme import Theme, ThemeController
+
+    def sin_red(_symbol: str) -> object:
+        raise ConnectionError("autocomprobación: sin red a propósito")
 
     app = QApplication.instance() or QApplication([])
     tema = ThemeController(app, Theme.LIGHT)
@@ -239,17 +248,23 @@ def _check_ui() -> str:
         db = Database(Path(carpeta) / "sharky.db")
         try:
             db.migrate()
-            ventana = MainWindow(tema, __version__, db=db)
+            mercado = YahooMarket(ticker_factory=sin_red, search_factory=sin_red)
+            ventana = MainWindow(tema, __version__, db=db, market=mercado, fx=mercado)
             for seccion in SECTIONS:
                 ventana.show_section(seccion.key)
+            cartera = ventana.page("cartera")
+            if not isinstance(cartera, PortfolioPage):
+                raise CheckFailure("la sección Cartera no se ha construido")
+            cartera.reload()
             tema.set_theme(Theme.DARK)
+            cartera.grab()
             ventana.close()
             ventana.deleteLater()
             _walk_setup_wizard(db, Path(carpeta))
         finally:
             db.close_all()
     return (
-        f"ventana creada, {len(SECTIONS)} secciones recorridas (Ajustes con Datos), "
+        f"ventana creada, {len(SECTIONS)} secciones recorridas (Cartera y Ajustes con Datos), "
         "temas claro y oscuro; asistente recorrido con la plantilla CSV"
     )
 
@@ -326,11 +341,13 @@ def run_setup_wizard(
 
 def run_gui() -> int:
     """Abre la ventana. Devuelve el código de salida del programa."""
+    from PySide6.QtCore import QThreadPool
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     from sharky.services import secrets
     from sharky.services.db import Database, DatabaseError
+    from sharky.services.market import YahooMarket, local_now
     from sharky.services.repositories import has_portfolio
     from sharky.services.settings import SettingsStore
     from sharky.ui.main_window import MainWindow
@@ -380,7 +397,10 @@ def run_gui() -> int:
         ajustes = almacen.load()  # el asistente ha guardado el bróker y el inicio con Windows
 
     remember_theme(tema, almacen, ajustes)
-    ventana = MainWindow(tema, __version__, db=db)
+    mercado = YahooMarket()  # yfinance se carga la primera vez que se usa, no ahora
+    ventana = MainWindow(
+        tema, __version__, db=db, market=mercado, fx=mercado, settings=ajustes, now=local_now
+    )
     al_frente["mostrar"] = ventana.bring_to_front
     bandeja = create_tray(ventana, ventana.bring_to_front, app.quit)
 
@@ -395,6 +415,10 @@ def run_gui() -> int:
     log.info("Ventana abierta (tema %s, bandeja %s)", tema.effective, "sí" if bandeja else "no")
     codigo = app.exec()
 
+    ventana.shutdown()
+    # Que ningún trabajo en segundo plano siga usando la base de datos al cerrarla.
+    if not QThreadPool.globalInstance().waitForDone(SHUTDOWN_WAIT_MS):
+        log.warning("Quedan trabajos en segundo plano al salir")
     db.close_all()
     if reinicio["pedido"]:
         unica.close()  # si no, la instancia nueva creería que esta sigue abierta
