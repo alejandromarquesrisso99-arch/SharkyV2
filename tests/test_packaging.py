@@ -6,6 +6,9 @@ mínimos, dónde se instala, qué borra al desinstalar y qué no toca nunca) y l
 """
 
 import importlib.util
+import io
+import logging
+import sys
 import tomllib
 from pathlib import Path
 
@@ -143,6 +146,30 @@ def test_si_no_esta_inno_setup_se_dice_como_instalarlo(build, monkeypatch):
         monkeypatch.delenv(variable, raising=False)
     assert build.buscar_iscc() is None
     assert build.ORDEN_WINGET == "winget install --id JRSoftware.InnoSetup -e"
+
+
+def test_el_registro_no_se_rompe_si_windows_redirige_la_salida_en_cp1252(build, monkeypatch):
+    # Así abre Windows la salida al redirigirla a un fichero o a la tubería de la CI.
+    bytes_salida, bytes_error = io.BytesIO(), io.BytesIO()
+    salida = io.TextIOWrapper(bytes_salida, encoding="cp1252")
+    error = io.TextIOWrapper(bytes_error, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", salida)
+    monkeypatch.setattr(sys, "stderr", error)
+
+    build.salida_en_utf8()
+    registro = logging.getLogger("test_build_salida")
+    monkeypatch.setattr(registro, "propagate", False)
+    manejador = logging.StreamHandler(sys.stdout)
+    registro.addHandler(manejador)
+    try:
+        registro.warning("  Cotización real: USD→EUR")
+    finally:
+        registro.removeHandler(manejador)
+    salida.flush()
+    error.flush()
+
+    assert bytes_salida.getvalue().decode("utf-8").rstrip() == "  Cotización real: USD→EUR"
+    assert bytes_error.getvalue() == b""  # ni rastro de «--- Logging error ---»
 
 
 # -- la CI ------------------------------------------------------------------------------

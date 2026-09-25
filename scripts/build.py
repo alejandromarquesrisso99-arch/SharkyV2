@@ -11,6 +11,7 @@ compilación.
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import shutil
@@ -131,7 +132,16 @@ def compilar_instalador(iscc: Path, version: str) -> Path:
     return destino
 
 
+def salida_en_utf8() -> None:
+    """Con la salida redirigida a un fichero o una tubería (la CI), Windows la abre en cp1252 y
+    cualquier carácter de fuera («→» en el informe del selftest) rompe el registro."""
+    for flujo in (sys.stdout, sys.stderr):
+        if isinstance(flujo, io.TextIOWrapper):
+            flujo.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    salida_en_utf8()
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     version = version_del_proyecto()
     iscc = buscar_iscc()  # se busca antes de compilar: mejor enterarse ya que al final
