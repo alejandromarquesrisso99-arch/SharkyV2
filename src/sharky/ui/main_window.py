@@ -4,7 +4,9 @@ Abajo del lateral, siempre visibles, el estado del mandato y la hora del último
 botón del Panel, cuántas cosas requieren atención. Todo sale del Panel (ui/panel.py).
 
 La ventana también enseña los avisos de niveles (GUIA §5.6): la ventana modal de un stop, por
-encima de todo, y las notificaciones, que manda por la bandeja (`set_notifier`).
+encima de todo, y las notificaciones, que manda por la bandeja (`set_notifier`). Y cuando
+Operar registra algo (H8), vigila otra vez los niveles y pone al día el Panel y las Tesis; si una
+compra ha abierto una tesis, la enseña en Tesis para completarla.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from sharky.ui.panel import TOKEN_STYLE, PanelPage, day_text, short_when
 from sharky.ui.portfolio import PortfolioPage, PriceRefresher
 from sharky.ui.theme import Theme, ThemeController
 from sharky.ui.theses import LevelNotifier, StopAlertDialog, ThesesPage
+from sharky.ui.trade import TradePage
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +121,10 @@ class MainWindow(QMainWindow):
         tesis = self._pages.get("tesis")
         if isinstance(tesis, ThesesPage):
             tesis.levelsChanged.connect(self._on_levels_changed)
+        operar = self._pages.get("operar")
+        if isinstance(operar, TradePage):
+            operar.recorded.connect(self._on_levels_changed)
+            operar.thesisOpened.connect(lambda ticker: self.navigate("tesis", ticker))
 
         self._sync_sidebar()
         self.show_section(SECTIONS[0].key)
@@ -325,8 +332,8 @@ class MainWindow(QMainWindow):
         self.show_section("panel")
 
     def _on_levels_changed(self) -> None:
-        """Han cambiado los números de una tesis: se vigila otra vez con los precios guardados
-        y el Panel (y el lateral) se ponen al día."""
+        """Han cambiado los números de una tesis, una operación o el efectivo: se vigila otra
+        vez con los precios guardados y el Panel (y el lateral) se ponen al día."""
         if self.levels is not None:
             try:
                 self.levels.check_now()

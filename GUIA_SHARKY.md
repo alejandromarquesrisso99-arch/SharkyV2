@@ -554,6 +554,12 @@ _(Apunta aquí lo que se te ocurra. Nada de esta lista se construye hasta cerrar
   que se vigila es el mayor entre el del usuario y el precio más alto visto con precio fiable
   menos el riesgo inicial: sube con el precio real y nunca baja; el número del usuario no se
   toca. Necesita una migración (modo y máximo visto en `theses`).
+- **Deshacer una operación mal registrada** (propuesto en el H8). Hoy una compra o una venta
+  registrada por error no se puede quitar: solo se compensa con otra operación o con «Ajustar
+  saldo». Deshacer tendría que retirar a la vez la operación, su movimiento de efectivo y lo que
+  hizo en su tesis (apertura, cambio de niveles o cierre), dejando rastro en el historial, y
+  solo si es la última operación de ese ticker (si no, cambiaría el coste medio de ventas ya
+  hechas).
 
 ---
 

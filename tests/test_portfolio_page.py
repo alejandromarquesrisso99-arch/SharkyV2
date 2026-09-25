@@ -41,6 +41,7 @@ from sharky.ui.portfolio import (
     footer_text,
 )
 from sharky.ui.theme import Theme, ThemeController
+from sharky.ui.trade import TradePage
 
 MADRID = timezone(timedelta(hours=2))
 AHORA = datetime(2026, 9, 24, 18, 5, tzinfo=MADRID)
@@ -447,7 +448,8 @@ def test_la_ventana_con_mercado_tiene_cartera_y_sus_botones(qtbot, qapp, cartera
     assert panel.header_actions.isVisible()
     # Panel y Cartera comparten la misma descarga de precios.
     assert pagina.refresher is ventana.refresher
-    assert isinstance(ventana.page("operar"), PlaceholderPage)
+    assert isinstance(ventana.page("operar"), TradePage)
+    assert isinstance(ventana.page("radar"), PlaceholderPage)
     ventana.shutdown()
 
 

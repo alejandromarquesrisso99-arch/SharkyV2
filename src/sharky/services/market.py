@@ -39,21 +39,22 @@ from sharky.core.ledger import build_ledger
 from sharky.core.models import Asset, AssetClass, FxRate, Price, PriceSource
 from sharky.core.valuation import (
     BASE_CURRENCY,
-    Valuation,
     fx_currency,
     fx_symbol,
     normalize_currency,
-    value_portfolio,
 )
 from sharky.services.db import Database
 from sharky.services.repositories import (
     AssetRepository,
-    CashMovementRepository,
     FxRateRepository,
     PriceRepository,
     ThesisRepository,
     TradeRepository,
 )
+
+# La valoración con lo guardado vive en los repositorios (la usa también el registro de
+# operaciones); se sigue importando desde aquí.
+from sharky.services.repositories import load_valuation as load_valuation
 
 log = logging.getLogger(__name__)
 
@@ -615,21 +616,6 @@ def refresh_market(
         " (cancelado)" if refresco.cancelled else "",
     )
     return refresco
-
-
-def load_valuation(conn: Connection, now: datetime, market_at: datetime | None = None) -> Valuation:
-    """La cartera valorada con lo que hay guardado. `market_at` es la hora de la última
-    actualización de esta sesión: lo descargado entonces cuenta como MERCADO."""
-    libro = build_ledger(TradeRepository(conn).list_all())
-    return value_portfolio(
-        libro.positions.values(),
-        {a.ticker: a for a in AssetRepository(conn).list_all()},
-        CashMovementRepository(conn).balance(),
-        PriceRepository(conn).latest_all(),
-        FxRateRepository(conn).latest_all(),
-        now,
-        market_at,
-    )
 
 
 # -- editar un activo y probar un símbolo ------------------------------------------------

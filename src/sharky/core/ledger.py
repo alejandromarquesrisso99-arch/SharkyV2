@@ -10,7 +10,9 @@ ponderado.
 - Vender todo deja la posición a cero, sin restos de redondeo: el coste que sale es justo el
   que quedaba.
 
-El efectivo tampoco se guarda: es la suma de los movimientos de efectivo.
+El efectivo tampoco se guarda: es la suma de los movimientos de efectivo. Cada operación
+tiene el suyo (OPERACION); los demás se registran a mano con su signo: lo que entra suma y lo
+que sale resta.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from datetime import date
 from decimal import Decimal
 
 from sharky.core.formatting import format_units
-from sharky.core.models import CashMovement, Trade, TradeKind
+from sharky.core.models import CashKind, CashMovement, Trade, TradeKind
 
 ZERO = Decimal("0")
 
@@ -133,6 +135,53 @@ def build_ledger(trades: Iterable[Trade]) -> Ledger:
     return Ledger(positions=abiertas, sales=tuple(ventas))
 
 
+def cycle_realized_pnl(ledger: Ledger, ticker: str) -> Decimal | None:
+    """El PnL realizado de la posición de `ticker` desde que se abrió por última vez: todas las
+    ventas desde la anterior que la dejó a cero (sin ella) hasta la última. Al venderla entera,
+    es el PnL de toda la posición, con las ventas parciales de antes. None si no hay ventas."""
+    ventas = [v for v in ledger.sales if v.ticker == ticker]
+    if not ventas:
+        return None
+    inicio = 0
+    for numero, venta in enumerate(ventas[:-1]):
+        if venta.closes_position:
+            inicio = numero + 1
+    return sum((v.pnl_eur for v in ventas[inicio:]), ZERO)
+
+
+def trade_amount_eur(units: Decimal, price: Decimal, fx_to_eur: Decimal) -> Decimal:
+    """Importe bruto de una operación en EUR (sin la comisión): unidades × precio × cambio."""
+    return units * price * fx_to_eur
+
+
+def trade_date_error(
+    day: date,
+    today: date,
+    ticker: str,
+    portfolio_start: date | None,
+    last_trade: date | None,
+) -> str | None:
+    """Por qué una operación no puede llevar esa fecha (None si puede).
+
+    Ni futura, ni anterior a la creación de la cartera (lo de antes ya está en sus posiciones
+    iniciales), ni anterior a la última operación de ese ticker: se cambiaría el coste medio de
+    ventas ya hechas o se reabriría una posición cerrada.
+    """
+    if day > today:
+        return "La fecha no puede ser futura."
+    if portfolio_start is not None and day < portfolio_start:
+        return (
+            f"La cartera empieza el {portfolio_start:%d/%m/%Y}: lo anterior ya está en sus "
+            "posiciones iniciales."
+        )
+    if last_trade is not None and day < last_trade:
+        return (
+            f"La última operación de {ticker} es del {last_trade:%d/%m/%Y}: esta tiene que ser "
+            "de ese día o posterior."
+        )
+    return None
+
+
 def cash_balance(movements: Iterable[CashMovement]) -> Decimal:
     """El efectivo es la suma de los movimientos de efectivo, con su signo."""
     return sum((m.amount_eur for m in movements), ZERO)
@@ -149,3 +198,44 @@ def trade_cash_amount(trade: Trade) -> Decimal | None:
     if trade.kind is TradeKind.BUY:
         return -(trade.amount_eur + trade.fee_eur)
     return trade.amount_eur - trade.fee_eur
+
+
+# -- movimientos de efectivo sueltos -----------------------------------------------------
+
+#: Cómo se llama cada tipo de movimiento al enseñarlo.
+CASH_LABELS: dict[CashKind, str] = {
+    CashKind.INITIAL: "Efectivo inicial",
+    CashKind.DEPOSIT: "Ingreso",
+    CashKind.WITHDRAWAL: "Retirada",
+    CashKind.DIVIDEND: "Dividendo",
+    CashKind.INTEREST: "Interés",
+    CashKind.FEE: "Comisión",
+    CashKind.TAX: "Impuesto",
+    CashKind.ADJUSTMENT: "Ajuste",
+    CashKind.TRADE: "Operación",
+}
+
+#: Los movimientos que se registran a mano con un importe, y su signo. El AJUSTE sale de «mi
+#: saldo real es X» (`adjustment_amount`); INICIAL y OPERACION los pone Sharky.
+MANUAL_CASH_SIGNS: dict[CashKind, int] = {
+    CashKind.DEPOSIT: 1,
+    CashKind.WITHDRAWAL: -1,
+    CashKind.DIVIDEND: 1,
+    CashKind.INTEREST: 1,
+    CashKind.FEE: -1,
+    CashKind.TAX: -1,
+}
+
+
+def signed_cash_amount(kind: CashKind, amount_eur: Decimal) -> Decimal:
+    """El importe con su signo: un ingreso de 100 € suma 100; una retirada de 100 €, −100."""
+    if kind not in MANUAL_CASH_SIGNS:
+        raise ValueError(f"El movimiento {kind} no se registra con un importe")
+    if amount_eur <= 0:
+        raise ValueError("El importe tiene que ser mayor que 0")
+    return amount_eur * MANUAL_CASH_SIGNS[kind]
+
+
+def adjustment_amount(cash_eur: Decimal, real_balance_eur: Decimal) -> Decimal:
+    """«Mi saldo real es X»: el ajuste que deja el efectivo en X."""
+    return real_balance_eur - cash_eur

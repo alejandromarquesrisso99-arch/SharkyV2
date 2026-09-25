@@ -10,7 +10,8 @@ transacción:
 Escribir fuera de una transacción es un error de programación y se rechaza.
 
 Aquí está lo común (dar de alta, consultar y listar) y lo propio de cada hito: la foto del NAV
-y la auditoría (H6), y las tesis y la vigilancia de sus niveles (H7).
+y la auditoría (H6), las tesis y la vigilancia de sus niveles (H7), y el registro de las
+operaciones y de los movimientos de efectivo (H8).
 """
 
 from __future__ import annotations
@@ -29,14 +30,37 @@ from functools import cache
 from typing import Any
 
 from sharky.core.csv_import import Opening
-from sharky.core.ledger import cash_balance
+from sharky.core.formatting import format_eur, format_units
+from sharky.core.ledger import (
+    MANUAL_CASH_SIGNS,
+    ZERO,
+    adjustment_amount,
+    build_ledger,
+    cash_balance,
+    cycle_realized_pnl,
+    signed_cash_amount,
+    trade_amount_eur,
+    trade_cash_amount,
+    trade_date_error,
+)
 from sharky.core.levels import (
     LevelCheck,
+    LevelChoice,
+    LevelStatus,
+    LevelUpdate,
     ProposalState,
+    buy_entry,
     changes,
+    chosen_levels,
+    close_event_text,
+    close_reason,
+    enlarge_reason,
     evaluate_levels,
     from_json,
+    kept_levels_text,
+    level_update,
     levels_of,
+    opened_by_buy_text,
     proposal_blocker,
     proposal_levels,
     proposal_states,
@@ -46,15 +70,30 @@ from sharky.core.levels import (
     to_json,
     validate_levels,
 )
-from sharky.core.mandate import Finding, MandateRules, audit, snapshot_for
+from sharky.core.mandate import (
+    FLOW_KINDS,
+    BuyOrder,
+    Finding,
+    MandateRules,
+    OrderValidation,
+    apply_flow,
+    audit,
+    cash_date_error,
+    snapshot_for,
+    validate_buy,
+    validate_sell,
+)
 from sharky.core.models import (
     AlertStatus,
     Asset,
     Author,
     Breach,
+    CashKind,
     CashMovement,
     FxRate,
     LevelAlert,
+    LevelAlertKind,
+    MandateState,
     NavSnapshot,
     Price,
     RadarAlert,
@@ -66,9 +105,17 @@ from sharky.core.models import (
     ThesisEventKind,
     ThesisStatus,
     Trade,
+    TradeKind,
     WatchlistItem,
 )
-from sharky.core.valuation import Valuation, normalize_currency
+from sharky.core.valuation import (
+    BASE_CURRENCY,
+    Valuation,
+    fx_currency,
+    normalize_currency,
+    to_eur_rate,
+    value_portfolio,
+)
 
 log = logging.getLogger(__name__)
 
@@ -517,6 +564,33 @@ def create_portfolio(conn: sqlite3.Connection, opening: Opening) -> None:
     NavSnapshotRepository(conn).save(opening.snapshot)
 
 
+def load_valuation(
+    conn: sqlite3.Connection, now: datetime, market_at: datetime | None = None
+) -> Valuation:
+    """La cartera valorada con lo que hay guardado. `market_at` es la hora de la última
+    actualización de esta sesión: lo descargado entonces cuenta como MERCADO."""
+    libro = build_ledger(TradeRepository(conn).list_all())
+    return value_portfolio(
+        libro.positions.values(),
+        {a.ticker: a for a in AssetRepository(conn).list_all()},
+        CashMovementRepository(conn).balance(),
+        PriceRepository(conn).latest_all(),
+        FxRateRepository(conn).latest_all(),
+        now,
+        market_at,
+    )
+
+
+def current_state(conn: sqlite3.Connection, valuation: Valuation, day: date) -> MandateState:
+    """El estado del mandato con esta valoración: el de la foto de `day` tal como quedaría (el
+    mismo que enseña el Panel). Solo lee."""
+    foto = snapshot_for(
+        day, valuation, NavSnapshotRepository(conn).list_all(),
+        CashMovementRepository(conn).list_all(),
+    )
+    return foto.state
+
+
 @dataclass(frozen=True)
 class RecordedValuation:
     """Lo que ha dejado guardado una valoración: su foto del NAV y la auditoría."""
@@ -838,3 +912,518 @@ class RunRepository(_Repository):
             "SELECT * FROM runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
         )
         return [row_to(Run, fila) for fila in filas]
+
+
+# -- operaciones y efectivo (GUIA §5.5, H8) ---------------------------------------------------
+
+
+class TradeError(ValueError):
+    """La operación o el movimiento no se puede registrar. El mensaje (una línea por error) se
+    puede enseñar."""
+
+    def __init__(self, errors: Sequence[str]) -> None:
+        self.errors = list(errors)
+        super().__init__("\n".join(self.errors))
+
+
+@dataclass(frozen=True)
+class TradeTicket:
+    """Una compra o una venta ya ejecutada en el bróker, tal como se escribe en Operar.
+
+    `fx_to_eur` son los EUR que vale una unidad de `currency` (1 en EUR). Stop, objetivo y
+    divisa de los niveles solo en las compras. `new_asset`, si el ticker es nuevo.
+    """
+
+    kind: TradeKind
+    ticker: str
+    trade_date: date
+    units: Decimal
+    price: Decimal
+    currency: str
+    fx_to_eur: Decimal = Decimal("1")
+    fee_eur: Decimal = ZERO
+    stop: Decimal | None = None
+    target: Decimal | None = None
+    levels_currency: str | None = None
+    reason: str = ""
+    new_asset: Asset | None = None
+
+    @property
+    def is_buy(self) -> bool:
+        return self.kind is TradeKind.BUY
+
+    @property
+    def amount_eur(self) -> Decimal:
+        return trade_amount_eur(self.units, self.price, self.fx_to_eur)
+
+    def to_trade(self, forced: bool) -> Trade:
+        return Trade(
+            trade_date=self.trade_date,
+            ticker=self.ticker,
+            kind=self.kind,
+            units=self.units,
+            price=self.price,
+            currency=self.currency,
+            fx_to_eur=self.fx_to_eur,
+            fee_eur=self.fee_eur,
+            amount_eur=self.amount_eur,
+            stop=self.stop if self.is_buy else None,
+            target=self.target if self.is_buy else None,
+            levels_currency=self.levels_currency if self.is_buy else None,
+            forced=forced,
+            reason=self.reason.strip() or None,
+        )
+
+
+@dataclass(frozen=True)
+class TradeReview:
+    """«Revisar»: la validación de una operación y lo que hará al registrarla."""
+
+    ticket: TradeTicket
+    validation: OrderValidation
+    state: MandateState
+    valuation: Valuation
+    asset: Asset
+    thesis: Thesis | None  # la tesis activa del ticker, si la hay
+    held_units: Decimal
+    levels_to_eur: Decimal | None = None
+    level_update: LevelUpdate | None = None  # ampliar con otros niveles: hay que preguntar
+    closes_position: bool = False
+    sale_pnl_eur: Decimal | None = None  # PnL realizado de esta venta
+    position_pnl_eur: Decimal | None = None  # de toda la posición, si esta venta la cierra
+
+    @property
+    def opens_thesis(self) -> bool:
+        return self.ticket.is_buy and self.thesis is None
+
+    @property
+    def closes_thesis(self) -> bool:
+        return not self.ticket.is_buy and self.closes_position and self.thesis is not None
+
+    @property
+    def new_asset(self) -> bool:
+        return self.ticket.new_asset is not None
+
+
+@dataclass(frozen=True)
+class RecordedTrade:
+    """Lo que ha dejado guardado una operación."""
+
+    trade: Trade
+    movement: CashMovement
+    review: TradeReview
+    forced: bool
+    opened_thesis: int | None = None
+    updated_thesis: int | None = None
+    closed_thesis: int | None = None
+
+
+def portfolio_start(conn: sqlite3.Connection) -> date | None:
+    """El día en que se creó la cartera (el de su efectivo INICIAL)."""
+    fila = conn.execute(
+        "SELECT MIN(movement_date) FROM cash_movements WHERE kind = ?", (CashKind.INITIAL.value,)
+    ).fetchone()
+    return date.fromisoformat(fila[0]) if fila and fila[0] else None
+
+
+def find_asset(conn: sqlite3.Connection, ticker: str) -> Asset | None:
+    """El activo de ese ticker, sin distinguir mayúsculas («asml» es ASML)."""
+    limpio = ticker.strip()
+    exacto = AssetRepository(conn).get(limpio)
+    if exacto is not None:
+        return exacto
+    return next(
+        (a for a in AssetRepository(conn).list_all() if a.ticker.upper() == limpio.upper()), None
+    )
+
+
+def rate_to_eur(conn: sqlite3.Connection, currency: str) -> Decimal | None:
+    """Los EUR que vale una unidad de `currency` con el último cambio guardado (1 en EUR; un
+    penique, la centésima parte de la libra). None si no hay ninguno."""
+    base = fx_currency(currency)
+    if base is None:
+        return Decimal("1")
+    return to_eur_rate(currency, FxRateRepository(conn).latest(base))
+
+
+def _check_ticket(
+    conn: sqlite3.Connection, ticket: TradeTicket, today: date
+) -> tuple[TradeTicket, Asset, Decimal | None]:
+    """Los datos de la operación (no el mandato): el ticker, el activo nuevo, la divisa, el
+    cambio, la comisión, la fecha y el cambio de los niveles. Devuelve la operación con el
+    ticker y las divisas normalizados, su activo y el cambio de los niveles, o lanza TradeError
+    con todos los errores."""
+    if ticket.kind not in (TradeKind.BUY, TradeKind.SELL):
+        raise ValueError(f"En Operar solo hay compras y ventas, no {ticket.kind}")
+    errores: list[str] = []
+    ticker = ticket.ticker.strip()
+    activo = find_asset(conn, ticker) if ticker else None
+    if not ticker:
+        errores.append("Falta el ticker.")
+    elif activo is None and not ticket.is_buy:
+        errores.append(f"No tienes {ticker}: solo se vende lo que hay en la cartera.")
+    elif activo is None and ticket.new_asset is None:
+        errores.append(f"{ticker} es nuevo: faltan sus datos (nombre, divisa de cotización…).")
+    elif activo is None and ticket.new_asset is not None:
+        if ticket.new_asset.ticker != ticker:
+            raise ValueError("El activo nuevo no es el del ticker de la operación")
+        activo = ticket.new_asset
+    if activo is not None:
+        ticker = activo.ticker
+
+    divisa = normalize_currency(ticket.currency or "")
+    if divisa is None:
+        errores.append(f"«{ticket.currency}» no es una divisa: tres letras, como EUR o USD.")
+    cambio = ticket.fx_to_eur
+    if divisa == BASE_CURRENCY:
+        cambio = Decimal("1")
+    elif cambio is None or cambio <= 0:
+        errores.append(f"Falta el cambio a EUR: cuántos euros vale 1 {divisa or 'unidad'}.")
+    if ticket.fee_eur < 0:
+        errores.append("La comisión no puede ser negativa.")
+
+    ultimas = TradeRepository(conn).list_for(ticker) if activo is not None else []
+    motivo_fecha = trade_date_error(
+        ticket.trade_date, today, ticker, portfolio_start(conn),
+        ultimas[-1].trade_date if ultimas else None,
+    )
+    if motivo_fecha:
+        errores.append(motivo_fecha)
+
+    niveles: str | None = None
+    if ticket.is_buy:
+        niveles = normalize_currency(ticket.levels_currency or "")
+        if niveles is None:
+            errores.append(
+                f"«{ticket.levels_currency or ''}» no es una divisa para los niveles: tres "
+                "letras, como EUR o USD."
+            )
+    limpio = replace(ticket, ticker=ticker, currency=divisa or ticket.currency,
+                     fx_to_eur=cambio, levels_currency=niveles)
+    cambio_niveles: Decimal | None = None
+    if ticket.is_buy and niveles is not None and divisa is not None and not errores:
+        cambio_niveles = (
+            limpio.fx_to_eur if niveles == divisa else rate_to_eur(conn, niveles)
+        )
+        if cambio_niveles is None:
+            errores.append(
+                f"No hay ningún cambio {fx_currency(niveles)}→EUR guardado para comparar los "
+                f"niveles en {niveles}: actualiza los precios o pon los niveles en EUR o en "
+                f"{divisa}."
+            )
+    if errores or activo is None:
+        raise TradeError(errores)
+    return limpio, activo, cambio_niveles
+
+
+def review_trade(
+    conn: sqlite3.Connection,
+    ticket: TradeTicket,
+    rules: MandateRules,
+    now: datetime,
+    market_at: datetime | None = None,
+) -> TradeReview:
+    """«Revisar»: comprueba los datos de la operación y la valida contra el mandato (GUIA
+    §5.5) con la cartera de ahora y el estado vigente. Solo lee.
+
+    Lanza TradeError si los datos no valen (antes de mirar el mandato).
+    """
+    hoy = now.date()
+    op, activo, cambio_niveles = _check_ticket(conn, ticket, hoy)
+    valoracion = load_valuation(conn, now, market_at)
+    estado = current_state(conn, valoracion, hoy)
+    operaciones = TradeRepository(conn).list_all()
+    posicion = build_ledger(operaciones).position(op.ticker)
+    tiene = posicion.units if posicion is not None else ZERO
+    tesis = ThesisRepository(conn).active_for(op.ticker)
+
+    if not op.is_buy:
+        validacion = validate_sell(op.ticker, op.units, op.price, tiene)
+        if not validacion.ok:
+            return TradeReview(op, validacion, estado, valoracion, activo, tesis, tiene)
+        despues = build_ledger([*operaciones, op.to_trade(False)])
+        venta = despues.sales[-1]
+        return TradeReview(
+            op, validacion, estado, valoracion, activo, tesis, tiene,
+            closes_position=venta.closes_position,
+            sale_pnl_eur=venta.pnl_eur,
+            position_pnl_eur=(
+                cycle_realized_pnl(despues, op.ticker) if venta.closes_position else None
+            ),
+        )
+
+    assert cambio_niveles is not None and op.levels_currency is not None
+    orden = BuyOrder(
+        ticker=op.ticker,
+        units=op.units,
+        price=op.price,
+        currency=op.currency,
+        price_to_eur=op.fx_to_eur,
+        fee_eur=op.fee_eur,
+        stop=op.stop,
+        target=op.target,
+        levels_currency=op.levels_currency,
+        levels_to_eur=cambio_niveles,
+        sector=activo.sector,
+    )
+    validacion = validate_buy(orden, valoracion, estado, rules)
+    actualizar: LevelUpdate | None = None
+    if tesis is not None and validacion.blocking is None:
+        assert op.stop is not None and op.target is not None
+        despues = build_ledger([*operaciones, op.to_trade(False)]).position(op.ticker)
+        assert despues is not None
+        actualizar = level_update(tesis, op.stop, op.target, op.levels_currency,
+                                  despues.avg_cost_eur, cambio_niveles)
+    return TradeReview(op, validacion, estado, valoracion, activo, tesis, tiene,
+                       levels_to_eur=cambio_niveles, level_update=actualizar)
+
+
+def _stop_hit_today(
+    conn: sqlite3.Connection, ticker: str, valuation: Valuation, today: date
+) -> tuple[Decimal, Decimal] | None:
+    """Si hoy saltó el stop de la tesis de `ticker`: (precio, stop) en EUR por unidad. Vale el
+    aviso guardado hoy o, si no lo hay, la vigilancia con los precios de ahora."""
+    for aviso in LevelAlertRepository(conn).list_for_date(today):
+        if aviso.ticker == ticker and aviso.kind is LevelAlertKind.STOP:
+            return aviso.price_eur, aviso.level_eur
+    for c in load_level_checks(conn, valuation):
+        if (
+            c.ticker == ticker
+            and c.status is LevelStatus.STOP
+            and c.price_eur is not None
+            and c.stop_eur is not None
+        ):
+            return c.price_eur, c.stop_eur
+    return None
+
+
+def close_thesis(
+    conn: sqlite3.Connection,
+    thesis: Thesis,
+    day: date,
+    pnl_eur: Decimal,
+    reason: str,
+    now: datetime,
+) -> int:
+    """Cierra una tesis con su PnL realizado y el motivo, y lo deja en el historial (CIERRE).
+    Devuelve el evento."""
+    _require_transaction(conn)
+    if thesis.id is None or thesis.status is not ThesisStatus.ACTIVE:
+        raise ThesisError(["Solo se cierra una tesis activa."])
+    ThesisRepository(conn).update(replace(
+        thesis, status=ThesisStatus.CLOSED, closed_on=day, realized_pnl_eur=pnl_eur,
+        close_reason=reason,
+    ))
+    id_evento = ThesisEventRepository(conn).add(ThesisEvent(
+        thesis.id, now, ThesisEventKind.CLOSED, Author.USER, close_event_text(pnl_eur, reason),
+        new_value=to_json({"pnl_realizado": str(pnl_eur)}),
+    ))
+    log.info("Tesis de %s cerrada", thesis.ticker)
+    return id_evento
+
+
+def _apply_level_choice(
+    conn: sqlite3.Connection,
+    update: LevelUpdate,
+    choice: LevelChoice,
+    ticket: TradeTicket,
+    now: datetime,
+) -> None:
+    """Lo que el usuario decide al ampliar: los niveles que actualiza (CAMBIO_NIVELES, con la
+    compra como motivo) o, si no actualiza nada, una nota con lo que traía la compra."""
+    tesis = update.thesis
+    assert tesis.id is not None
+    if not choice.any:
+        texto = kept_levels_text(update, ticket.trade_date, ticket.units, ticket.price,
+                                 ticket.currency)
+        ThesisEventRepository(conn).add(
+            ThesisEvent(tesis.id, now, ThesisEventKind.REVIEW, Author.USER, texto)
+        )
+        return
+    nuevos = chosen_levels(update, choice)
+    edicion = ThesisEdit(
+        entry_price=to_decimal(nuevos["entrada"]),
+        stop=to_decimal(nuevos["stop"]),
+        target=to_decimal(nuevos["objetivo"]),
+        conviction=tesis.conviction,
+        levels_currency=nuevos["divisa"],
+        why=tesis.why,
+        catalysts=tesis.catalysts,
+        risks=tesis.risks,
+        invalidation=tesis.invalidation,
+    )
+    update_thesis(conn, tesis.id, edicion, now,
+                  enlarge_reason(ticket.trade_date, ticket.units, ticket.price, ticket.currency))
+
+
+def _trade_note(trade: Trade) -> str:
+    que = "Compra" if trade.kind is TradeKind.BUY else "Venta"
+    return f"{que} de {format_units(trade.units)} {trade.ticker}"
+
+
+def record_trade(
+    conn: sqlite3.Connection,
+    ticket: TradeTicket,
+    rules: MandateRules,
+    now: datetime,
+    market_at: datetime | None = None,
+    *,
+    forced: bool = False,
+    choice: LevelChoice | None = None,
+) -> RecordedTrade:
+    """Registra una compra o una venta (GUIA §5.5). Va dentro de la transacción de quien llama:
+    el activo nuevo, la operación, su movimiento de efectivo y lo que toca en su tesis entran
+    juntos o no entra nada.
+
+    - Vuelve a validar. Un fallo que no se puede forzar no se registra nunca; uno del mandato,
+      solo con `forced` y un motivo, y la operación queda marcada como forzada.
+    - Comprar un ticker sin tesis la abre con el precio de compra, el stop y el objetivo.
+    - Ampliar una tesis con otros niveles necesita `choice` (lo que el usuario decide).
+    - Vender toda la posición cierra su tesis con el PnL realizado de toda la posición y el
+      motivo; una venta parcial no la toca.
+    """
+    _require_transaction(conn)
+    revision = review_trade(conn, ticket, rules, now, market_at)
+    op = revision.ticket
+    validacion = revision.validation
+    bloqueo = validacion.blocking
+    if bloqueo is not None:
+        raise TradeError([bloqueo.message])
+    forzada = forced and not validacion.ok
+    if not validacion.ok and not forced:
+        fallo = validacion.failure
+        assert fallo is not None
+        raise TradeError([
+            f"No cumple el mandato: {fallo.message} Para registrarla igualmente, marca "
+            "«Registrar igualmente» y escribe el motivo."
+        ])
+    if forzada and not op.reason.strip():
+        raise TradeError(["Para registrarla igualmente hace falta escribir el motivo."])
+    if revision.level_update is not None and choice is None:
+        raise TradeError([
+            f"Los niveles de la compra no coinciden con los de la tesis de {op.ticker}: falta "
+            "decidir si la actualizas."
+        ])
+
+    if op.new_asset is not None:
+        AssetRepository(conn).add(revision.asset)
+    operacion = op.to_trade(forzada)
+    operacion = replace(operacion, id=TradeRepository(conn).add(operacion))
+    importe = trade_cash_amount(operacion)
+    assert importe is not None
+    movimiento = CashMovement(op.trade_date, CashKind.TRADE, importe, operacion.id,
+                              _trade_note(operacion))
+    movimiento = replace(movimiento, id=CashMovementRepository(conn).add(movimiento))
+
+    abierta = actualizada = cerrada = None
+    tesis = revision.thesis
+    if op.is_buy and tesis is None:
+        assert revision.levels_to_eur is not None and op.levels_currency is not None
+        entrada = buy_entry(op.price, op.currency, op.fx_to_eur, op.levels_currency,
+                            revision.levels_to_eur)
+        nueva = Thesis(op.ticker, op.levels_currency, op.trade_date, entry_price=entrada,
+                       stop=op.stop, target=op.target)
+        texto = opened_by_buy_text(op.trade_date, op.units, op.price, op.currency)
+        abierta = create_theses(conn, [nueva], now, note=texto)[0]
+    elif op.is_buy and tesis is not None and revision.level_update is not None:
+        assert choice is not None
+        _apply_level_choice(conn, revision.level_update, choice, op, now)
+        actualizada = tesis.id
+    elif revision.closes_thesis and tesis is not None:
+        pnl = revision.position_pnl_eur
+        assert pnl is not None
+        salto = _stop_hit_today(conn, op.ticker, revision.valuation, now.date())
+        close_thesis(conn, tesis, op.trade_date, pnl, close_reason(op.trade_date, salto, op.reason),
+                     now)
+        cerrada = tesis.id
+
+    log.info("%s registrada: %s %s%s", "Compra" if op.is_buy else "Venta",
+             format_units(op.units), op.ticker, " (forzada)" if forzada else "")
+    return RecordedTrade(operacion, movimiento, revision, forzada, abierta, actualizada, cerrada)
+
+
+# -- movimientos de efectivo sueltos ---------------------------------------------------------
+
+
+def _add_cash(conn: sqlite3.Connection, movement: CashMovement, now: datetime) -> CashMovement:
+    """Guarda un movimiento suelto. Un ingreso o una retirada de hoy, si la foto de hoy ya
+    estaba hecha, suma o resta participaciones a esa foto (al valor por participación de la
+    foto): si no, mañana contaría como ganancia o pérdida."""
+    id_movimiento = CashMovementRepository(conn).add(movement)
+    if movement.kind in FLOW_KINDS and movement.movement_date == now.date():
+        fotos = NavSnapshotRepository(conn)
+        hoy = fotos.get(now.date())
+        if hoy is not None:
+            _insert(conn, fotos.table, apply_flow(hoy, movement.amount_eur),
+                    verb="INSERT OR REPLACE")
+    return replace(movement, id=id_movimiento)
+
+
+def _check_cash_date(conn: sqlite3.Connection, day: date, now: datetime) -> list[str]:
+    ultima = NavSnapshotRepository(conn).latest()
+    motivo = cash_date_error(day, now.date(), ultima.snapshot_date if ultima else None)
+    return [motivo] if motivo else []
+
+
+def record_cash_movement(
+    conn: sqlite3.Connection,
+    kind: CashKind,
+    day: date,
+    amount_eur: Decimal,
+    now: datetime,
+    note: str = "",
+) -> CashMovement:
+    """Un ingreso, retirada, dividendo, interés, comisión o impuesto. `amount_eur` es positivo:
+    el signo sale del tipo. Ningún movimiento deja el efectivo por debajo de 0. Va dentro de la
+    transacción de quien llama."""
+    _require_transaction(conn)
+    if kind not in MANUAL_CASH_SIGNS:
+        raise ValueError(f"El movimiento {kind} no se registra con un importe")
+    errores = _check_cash_date(conn, day, now)
+    if amount_eur <= 0:
+        errores.append("El importe tiene que ser mayor que 0.")
+    else:
+        efectivo = CashMovementRepository(conn).balance()
+        if efectivo + signed_cash_amount(kind, amount_eur) < 0:
+            errores.append(
+                f"No hay tanto efectivo: hay {format_eur(efectivo)} y el movimiento saca "
+                f"{format_eur(amount_eur)}. Si tu saldo real es otro, usa «Ajustar saldo»."
+            )
+    if errores:
+        raise TradeError(errores)
+    movimiento = _add_cash(
+        conn,
+        CashMovement(day, kind, signed_cash_amount(kind, amount_eur), note=note.strip() or None),
+        now,
+    )
+    log.info("Movimiento de efectivo registrado: %s", kind.value)
+    return movimiento
+
+
+def record_balance_adjustment(
+    conn: sqlite3.Connection,
+    day: date,
+    real_balance_eur: Decimal,
+    now: datetime,
+    note: str = "",
+) -> CashMovement:
+    """«Mi saldo real es X»: el AJUSTE que deja el efectivo en X. Va dentro de la transacción
+    de quien llama."""
+    _require_transaction(conn)
+    errores = _check_cash_date(conn, day, now)
+    efectivo = CashMovementRepository(conn).balance()
+    if real_balance_eur < 0:
+        errores.append("El saldo real no puede ser negativo.")
+    elif real_balance_eur == efectivo:
+        errores.append(f"Tu efectivo ya es {format_eur(efectivo)}: no hace falta ningún ajuste.")
+    if errores:
+        raise TradeError(errores)
+    nota = note.strip() or f"Saldo real {format_eur(real_balance_eur)}"
+    movimiento = _add_cash(
+        conn,
+        CashMovement(day, CashKind.ADJUSTMENT, adjustment_amount(efectivo, real_balance_eur),
+                     note=nota),
+        now,
+    )
+    log.info("Ajuste de saldo registrado")
+    return movimiento

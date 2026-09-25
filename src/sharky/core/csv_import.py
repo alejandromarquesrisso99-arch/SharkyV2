@@ -432,6 +432,64 @@ def _asset_class(texto: str) -> AssetClass | None:
         return None
 
 
+# -- un activo dado de alta a mano --------------------------------------------------------
+
+
+def asset_from_fields(
+    ticker: str,
+    name: str,
+    currency: str,
+    *,
+    isin: str = "",
+    yahoo_symbol: str = "",
+    sector: str = "",
+    asset_class: AssetClass = AssetClass.STOCK,
+) -> tuple[Asset | None, list[str]]:
+    """Un activo nuevo escrito a mano (la compra de un ticker nuevo en Operar), con las mismas
+    reglas que el CSV (GUIA §5.2). Devuelve el activo, o None y todos los errores a la vez."""
+    errores: list[str] = []
+    ticker = ticker.strip()
+    nombre = name.strip()
+    isin_limpio = isin.strip().upper() or None
+    simbolo = yahoo_symbol.strip() or None
+    sector_limpio = sector.strip() or None
+    if not ticker:
+        errores.append("Falta el ticker.")
+    elif not _TICKER.match(ticker):
+        errores.append(
+            f"El ticker «{ticker}» no es válido: sin espacios, empieza por letra o número y "
+            "solo lleva letras, números, «_», «.» o «-»."
+        )
+    if not nombre:
+        errores.append("Falta el nombre del activo.")
+    if isin_limpio is not None and not _ISIN.match(isin_limpio):
+        errores.append(
+            f"El ISIN «{isin.strip()}» no es válido: son 12 caracteres, dos letras de país, "
+            "nueve letras o números y un dígito final."
+        )
+    divisa = normalize_currency(currency)
+    if not currency.strip():
+        errores.append("Falta la divisa de cotización.")
+    elif divisa is None:
+        errores.append(
+            f"La divisa de cotización «{currency.strip()}» no es válida: son 3 letras (EUR, "
+            "USD, GBp, HKD…)."
+        )
+    if simbolo is not None and re.search(r"\s", simbolo):
+        errores.append("El símbolo no puede llevar espacios (por ejemplo, SAN.MC).")
+    if sector_limpio is not None and re.search(r"\s", sector_limpio):
+        errores.append(
+            f"El sector «{sector_limpio}» no puede llevar espacios (usa «_»: Renta_Variable)."
+        )
+    if errores or divisa is None:
+        return None, errores
+    return (
+        Asset(ticker, nombre, divisa, asset_class, isin=isin_limpio, yahoo_symbol=simbolo,
+              sector=sector_limpio),
+        [],
+    )
+
+
 # -- la cartera inicial -----------------------------------------------------------------
 
 

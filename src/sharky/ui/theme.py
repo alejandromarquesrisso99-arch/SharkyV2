@@ -137,6 +137,10 @@ _STYLESHEET = Template(
     QFrame#dangerBox {
         background-color: $surface; border: 1px solid $danger; border-radius: 8px;
     }
+    QFrame#okBox { background-color: $ok_fill; border: 1px solid $ok_line; border-radius: 8px; }
+    QFrame#rejectBox {
+        background-color: $danger_fill; border: 1px solid $danger_line; border-radius: 8px;
+    }
 
     QLabel#stepNumber {
         background-color: $surface_alt; color: $text_muted; border-radius: 14px;
@@ -157,6 +161,10 @@ _STYLESHEET = Template(
         border-radius: 6px; padding: 6px 8px;
     }
     QLineEdit:focus { border: 1px solid $accent; }
+    QDateEdit {
+        background-color: $surface; color: $text; border: 1px solid $border;
+        border-radius: 6px; padding: 5px 8px;
+    }
     QTableView {
         background-color: $surface; color: $text; border: none; gridline-color: $border;
         selection-background-color: $surface_selected; selection-color: $text;

@@ -30,7 +30,7 @@ redondea antes de comparar.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from enum import StrEnum
@@ -253,6 +253,49 @@ def snapshot_for(
         state=estado,
         coverage=valuation.coverage,
         reliable=fiable,
+    )
+
+
+def apply_flow(snapshot: NavSnapshot, amount_eur: Decimal) -> NavSnapshot:
+    """La foto de un día con un ingreso (o una retirada, en negativo) de ese mismo día que se ha
+    registrado después de hacerla.
+
+    El dinero entra o sale al valor por participación de la foto: cambian el NAV, el efectivo y
+    las participaciones, y el valor, el máximo, el drawdown y el estado se quedan como estaban.
+    Sin esto, la foto de mañana partiría de una de hoy sin el ingreso, y el ingreso contaría
+    como ganancia. El efectivo se conoce al céntimo, así que suma a la parte fiable.
+    """
+    nav = snapshot.nav_eur + amount_eur
+    fiable = snapshot.coverage * snapshot.nav_eur + amount_eur
+    cobertura = min(ONE, max(ZERO, fiable / nav)) if nav > 0 else ZERO
+    participaciones = snapshot.fund_units
+    if snapshot.unit_value > 0:
+        participaciones += amount_eur / snapshot.unit_value
+    return replace(
+        snapshot,
+        nav_eur=nav,
+        cash_eur=snapshot.cash_eur + amount_eur,
+        fund_units=max(ZERO, participaciones),
+        coverage=cobertura,
+    )
+
+
+def cash_date_error(day: date, today: date, last_snapshot: date | None) -> str | None:
+    """Por qué un movimiento de efectivo no puede llevar esa fecha (None si puede).
+
+    Ni futura, ni el día de la última foto del patrimonio o antes, salvo que sea hoy: esa foto
+    ya está guardada sin él, y un ingreso o una retirada contaría después como ganancia o
+    pérdida.
+    """
+    if day > today:
+        return "La fecha no puede ser futura."
+    if last_snapshot is None or day == today or day > last_snapshot:
+        return None
+    if last_snapshot >= today:
+        return "Hoy ya hay foto del patrimonio: el movimiento tiene que llevar la fecha de hoy."
+    return (
+        f"La última foto del patrimonio es del {last_snapshot:%d/%m/%Y}: el movimiento tiene "
+        "que ser posterior (o de hoy)."
     )
 
 
@@ -519,9 +562,14 @@ BUY_CHECKS: tuple[Check, ...] = (
 
 @dataclass(frozen=True)
 class CheckResult:
+    """Un paso de la validación. `forceable` dice si «Registrar igualmente» lo puede saltar:
+    solo los fallos del mandato; los datos imposibles (sin importe, niveles que faltan o al
+    revés, efectivo negativo, vender lo que no hay) no se fuerzan nunca."""
+
     check: Check
     passed: bool
     message: str
+    forceable: bool = True
 
 
 @dataclass(frozen=True)
@@ -548,6 +596,16 @@ class OrderValidation:
         """Los demás pasos que fallan, después del primero («Además, …»)."""
         fallos = [r for r in self.results if not r.passed]
         return tuple(fallos[1:])
+
+    @property
+    def blocking(self) -> CheckResult | None:
+        """El primer fallo que no se puede forzar: con él, la operación no se registra."""
+        return next((r for r in self.results if not r.passed and not r.forceable), None)
+
+    @property
+    def forceable(self) -> bool:
+        """Falla, pero solo por el mandato: «Registrar igualmente» la puede guardar."""
+        return not self.ok and self.blocking is None
 
     def result(self, check: Check) -> CheckResult | None:
         return next((r for r in self.results if r.check is check), None)
@@ -591,6 +649,15 @@ class BuyOrder:
         return value * (self.levels_to_eur if level else self.price_to_eur)
 
 
+def _amounts_text(price: Decimal, units: Decimal) -> str:
+    """El motivo del paso 2, con la concordancia de lo que falla."""
+    if price <= 0 and units <= 0:
+        return "Hace falta que el precio y las unidades sean mayores que 0."
+    if price <= 0:
+        return "Hace falta que el precio sea mayor que 0."
+    return "Hace falta que las unidades sean mayores que 0."
+
+
 def _level(value: Decimal, currency: str) -> str:
     return f"{format_price(value)} {currency}"
 
@@ -621,12 +688,9 @@ def validate_buy(
 
     # 2. Precio y unidades.
     if order.price <= 0 or order.units <= 0:
-        que = "el precio y las unidades" if order.price <= 0 and order.units <= 0 else (
-            "el precio" if order.price <= 0 else "las unidades"
-        )
-        resultados.append(
-            CheckResult(Check.AMOUNTS, False, f"Hace falta que {que} sean mayores que 0.")
-        )
+        resultados.append(CheckResult(
+            Check.AMOUNTS, False, _amounts_text(order.price, order.units), forceable=False
+        ))
         return OrderValidation(tuple(resultados))  # sin importe no hay nada más que medir
     resultados.append(CheckResult(Check.AMOUNTS, True, "Precio y unidades mayores que 0."))
 
@@ -642,7 +706,7 @@ def validate_buy(
         falta = "el stop y el objetivo" if order.stop is None and order.target is None else (
             "el stop" if order.stop is None else "el objetivo"
         )
-        resultados.append(CheckResult(Check.LEVELS, False, f"Falta {falta}."))
+        resultados.append(CheckResult(Check.LEVELS, False, f"Falta {falta}.", forceable=False))
     else:
         precio = order.comparable(order.price, level=False)
         stop = order.comparable(order.stop, level=True)
@@ -655,12 +719,14 @@ def validate_buy(
                 Check.LEVELS, False,
                 f"El stop ({stop_txt}) tiene que quedar por debajo del precio de compra "
                 f"({precio_txt}){en_eur}.",
+                forceable=False,
             ))
         elif objetivo <= precio:
             resultados.append(CheckResult(
                 Check.LEVELS, False,
                 f"El objetivo ({objetivo_txt}) tiene que quedar por encima del precio de "
                 f"compra ({precio_txt}){en_eur}.",
+                forceable=False,
             ))
         else:
             niveles = (precio, stop, objetivo)
@@ -746,7 +812,9 @@ def validate_buy(
         resultados.append(CheckResult(
             Check.CASH, False,
             f"No hay efectivo suficiente: la compra y la comisión suman "
-            f"{format_eur(importe + order.fee_eur)} y hay {format_eur(valuation.cash_eur)}.",
+            f"{format_eur(importe + order.fee_eur)} y hay {format_eur(valuation.cash_eur)}. "
+            "Registra antes el ingreso que falta o ajusta el saldo.",
+            forceable=False,
         ))
     elif nav_despues > 0:
         peso = efectivo_despues / nav_despues
@@ -771,18 +839,16 @@ def validate_sell(
 ) -> OrderValidation:
     """Una venta solo exige precio y unidades mayores que 0 y no vender más de lo que hay."""
     if price <= 0 or units <= 0:
-        que = "el precio y las unidades" if price <= 0 and units <= 0 else (
-            "el precio" if price <= 0 else "las unidades"
-        )
-        return OrderValidation(
-            (CheckResult(Check.AMOUNTS, False, f"Hace falta que {que} sean mayores que 0."),)
-        )
+        return OrderValidation((
+            CheckResult(Check.AMOUNTS, False, _amounts_text(price, units), forceable=False),
+        ))
     resultados = [CheckResult(Check.AMOUNTS, True, "Precio y unidades mayores que 0.")]
     if units > held_units:
         resultados.append(CheckResult(
             Check.HOLDING, False,
             f"No se pueden vender {format_units(units)} unidades de {ticker}: solo hay "
             f"{format_units(held_units)}.",
+            forceable=False,
         ))
     else:
         resultados.append(CheckResult(

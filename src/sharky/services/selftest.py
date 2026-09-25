@@ -467,6 +467,108 @@ def _check_mandate() -> str:
     )
 
 
+def _check_trades() -> str:
+    """H8: en una base de datos temporal, una compra de un ticker nuevo (activo, operación,
+    efectivo y tesis en una transacción), una venta parcial que no cierra la tesis y una total
+    que sí, una compra forzada que exige motivo y el efectivo igual a la suma de movimientos."""
+    from sharky.core.models import (
+        Asset,
+        CashKind,
+        CashMovement,
+        Price,
+        PriceSource,
+        ThesisStatus,
+        Trade,
+        TradeKind,
+    )
+    from sharky.services.db import Database
+    from sharky.services.repositories import (
+        AssetRepository,
+        CashMovementRepository,
+        PriceRepository,
+        ThesisRepository,
+        TradeError,
+        TradeRepository,
+        TradeTicket,
+        record_trade,
+    )
+    from sharky.services.settings import MandateSettings
+
+    d = Decimal
+    hoy = date(2026, 1, 2)
+    ahora = datetime(2026, 1, 2, 18, 0, tzinfo=UTC)
+    reglas = MandateSettings().rules()
+    nuevo = Asset("NUEVO", "Nuevo S.A.", "EUR", sector="Industria")
+
+    def compra(ticker: str, unidades: str, precio: str, stop: str, objetivo: str,
+               motivo: str = "") -> TradeTicket:
+        return TradeTicket(TradeKind.BUY, ticker, hoy, d(unidades), d(precio), "EUR", d(1),
+                           d(1), d(stop), d(objetivo), "EUR", motivo,
+                           nuevo if ticker == "NUEVO" else None)
+
+    def venta(unidades: str, precio: str) -> TradeTicket:
+        return TradeTicket(TradeKind.SELL, "NUEVO", hoy, d(unidades), d(precio), "EUR", d(1),
+                           d(1))
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_trades_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+        try:
+            db.migrate()
+            with db.transaction() as conn:  # SAN 100 × 5 € y 9.000 € de efectivo
+                AssetRepository(conn).add(Asset("SAN", "Banco", "EUR", yahoo_symbol="SAN.MC",
+                                                sector="Banca"))
+                TradeRepository(conn).add(Trade(hoy, "SAN", TradeKind.OPENING, d(100), d(4),
+                                                "EUR", d(1), d(0), d(400)))
+                PriceRepository(conn).save(Price("SAN", hoy, d(5), "EUR", PriceSource.MARKET,
+                                                 ahora))
+                CashMovementRepository(conn).add(CashMovement(hoy, CashKind.INITIAL, d(9000)))
+            with db.transaction() as conn:
+                abierta = record_trade(conn, compra("NUEVO", "10", "50", "45", "65"), reglas,
+                                       ahora).opened_thesis
+            with db.transaction() as conn:
+                parcial = record_trade(conn, venta("4", "60"), reglas, ahora)
+            tesis = ThesisRepository(db.connection())
+            if abierta is None or tesis.get(abierta).status is not ThesisStatus.ACTIVE:
+                raise CheckFailure("la compra no ha abierto la tesis o la venta parcial la cerró")
+            with db.transaction() as conn:
+                total = record_trade(conn, venta("6", "40"), reglas, ahora)
+            cerrada = tesis.get(abierta)
+            # 10 × 50 + 1 = 501 € de coste; ventas: 239 − 200,4 y 239 − 300,6.
+            if (
+                total.closed_thesis != abierta
+                or cerrada.status is not ThesisStatus.CLOSED
+                or cerrada.realized_pnl_eur != d("-23")
+                or parcial.review.sale_pnl_eur != d("38.6")
+            ):
+                raise CheckFailure("la venta total no ha cerrado la tesis con su PnL realizado")
+            # SAN al 10,5 %: el mandato la rechaza; forzada, solo con motivo.
+            try:
+                with db.transaction() as conn:
+                    record_trade(conn, compra("SAN", "100", "5", "4.5", "6"), reglas, ahora,
+                                 forced=True)
+            except TradeError:
+                pass
+            else:
+                raise CheckFailure("se ha forzado una operación sin motivo")
+            with db.transaction() as conn:
+                forzada = record_trade(conn, compra("SAN", "100", "5", "4.5", "6", "Prueba"),
+                                       reglas, ahora, forced=True)
+            movimientos = CashMovementRepository(db.connection()).list_all()
+            efectivo = CashMovementRepository(db.connection()).balance()
+        finally:
+            db.close_all()
+    if not forzada.trade.forced or forzada.trade.reason != "Prueba":
+        raise CheckFailure("la operación forzada no ha quedado marcada con su motivo")
+    if efectivo != sum((m.amount_eur for m in movimientos), d(0)) or efectivo != d("8476"):
+        raise CheckFailure(f"el efectivo no cuadra con sus movimientos: {efectivo}")
+    return (
+        "compra con su tesis abierta, venta parcial (tesis abierta) y total (tesis cerrada con "
+        "su PnL), forzada solo con motivo y efectivo = suma de movimientos"
+    )
+
+
 def _check_levels() -> str:
     """H7: stop, objetivo y su propuesta, niveles en otra divisa y NO VERIFICABLE, y en una base
     de datos temporal, una tesis con su historial y un solo aviso de stop al día."""
@@ -689,6 +791,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Precios y valoración", _check_market),
         Check("Mandato y foto del NAV", _check_mandate),
         Check("Tesis y niveles", _check_levels),
+        Check("Operaciones y efectivo", _check_trades),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

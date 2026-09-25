@@ -238,10 +238,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _check_ui() -> str:
     """Comprobación de la interfaz para el `--selftest` (app.py sí puede mirar la capa ui)."""
+    from decimal import Decimal
+
     from PySide6.QtWidgets import QApplication
 
     from sharky.services.db import Database
-    from sharky.services.market import YahooMarket
+    from sharky.services.market import YahooMarket, local_now
     from sharky.services.selftest import CheckFailure
     from sharky.ui.main_window import MainWindow
     from sharky.ui.pages import SECTIONS
@@ -249,6 +251,7 @@ def _check_ui() -> str:
     from sharky.ui.portfolio import PortfolioPage
     from sharky.ui.theme import Theme, ThemeController
     from sharky.ui.theses import StopAlertDialog, ThesesPage
+    from sharky.ui.trade import CashDialog, TradePage
 
     def sin_red(_symbol: str) -> object:
         raise ConnectionError("autocomprobación: sin red a propósito")
@@ -274,16 +277,24 @@ def _check_ui() -> str:
             tesis = ventana.page("tesis")
             if not isinstance(tesis, ThesesPage):
                 raise CheckFailure("la sección Tesis no se ha construido")
+            operar = ventana.page("operar")
+            if not isinstance(operar, TradePage):
+                raise CheckFailure("la sección Operar no se ha construido")
             cartera.reload()
             panel.reload()
             tesis.reload()
+            operar.reload()
             aviso = StopAlertDialog([])  # la ventana del aviso de stop
+            efectivo = CashDialog(db, local_now, None, Decimal(0))  # «Ajustar saldo»
             tema.set_theme(Theme.DARK)
             cartera.grab()
             panel.grab()  # el gráfico del valor por participación (pyqtgraph)
             tesis.grab()
+            operar.grab()
             aviso.grab()
+            efectivo.grab()
             destroy_now(aviso)
+            destroy_now(efectivo)
             ventana.close()
             destroy_now(ventana)
             _walk_setup_wizard(db, Path(carpeta))
@@ -291,8 +302,8 @@ def _check_ui() -> str:
             db.close_all()
     return (
         f"ventana creada, {len(SECTIONS)} secciones recorridas (Panel con su gráfico, Cartera, "
-        "Tesis con su aviso de stop y Ajustes con Datos), temas claro y oscuro; asistente "
-        "recorrido con la plantilla CSV"
+        "Operar con su diálogo de efectivo, Tesis con su aviso de stop y Ajustes con Datos), "
+        "temas claro y oscuro; asistente recorrido con la plantilla CSV"
     )
 
 

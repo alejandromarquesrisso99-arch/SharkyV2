@@ -37,7 +37,7 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 
-from sharky.core.formatting import format_eur, format_price, format_signed_amount
+from sharky.core.formatting import format_eur, format_price, format_signed_amount, format_units
 from sharky.core.models import (
     Author,
     FxRate,
@@ -743,6 +743,11 @@ def describe_event(event: ThesisEvent, state: ProposalState | None = None) -> Hi
     if kind is ThesisEventKind.REVIEW:
         if event.ref_event_id is not None:
             return HistoryEntry(event, "Propuesta descartada por ti", event.text)
+        if event.author is Author.USER and not despues and event.text:
+            # Una nota tuya (por ejemplo, al ampliar sin cambiar los niveles): la primera línea
+            # es el título y el resto, el detalle.
+            titulo, _, detalle = event.text.partition("\n")
+            return HistoryEntry(event, titulo, detalle)
         if event.author is Author.USER:
             nombres = ", ".join(TEXT_NAMES.get(k, k) for k in despues)
             return HistoryEntry(event, f"Textos editados por ti: {nombres}" if nombres else
@@ -759,3 +764,160 @@ def history(events: Sequence[ThesisEvent]) -> list[HistoryEntry]:
         describe_event(e, estados.get(e.id) if e.id is not None else None)
         for e in reversed(list(events))
     ]
+
+
+# -- las tesis y las operaciones (GUIA §5.5, H8) ----------------------------------------------
+
+#: Decimales de un nivel calculado al pasarlo de divisa.
+LEVEL_DECIMALS = 6
+
+
+def to_levels(value_eur: Decimal, levels_to_eur: Decimal) -> Decimal:
+    """Un importe por unidad en EUR pasado a la divisa de los niveles (a 6 decimales)."""
+    if levels_to_eur <= 0:
+        raise ValueError("Hace falta el cambio a EUR de la divisa de los niveles")
+    return (value_eur / levels_to_eur).quantize(
+        Decimal(1).scaleb(-LEVEL_DECIMALS), rounding=ROUND_HALF_UP
+    )
+
+
+def buy_entry(
+    price: Decimal,
+    currency: str,
+    price_to_eur: Decimal,
+    levels_currency: str,
+    levels_to_eur: Decimal,
+) -> Decimal:
+    """La entrada de la tesis que abre una compra: el precio de compra en la divisa de los
+    niveles (tal cual si coinciden; si no, pasando por EUR con los cambios de la compra)."""
+    if currency == levels_currency:
+        return price
+    return to_levels(price * price_to_eur, levels_to_eur)
+
+
+def trade_text(day: date, units: Decimal, price: Decimal, currency: str) -> str:
+    """«compra del 25/09/2026: 2 a 742,10 EUR»."""
+    return f"compra del {day:%d/%m/%Y}: {format_units(units)} a {format_price(price)} {currency}"
+
+
+def opened_by_buy_text(day: date, units: Decimal, price: Decimal, currency: str) -> str:
+    """El texto del evento de creación de una tesis que abre una compra."""
+    return f"Tesis abierta con la {trade_text(day, units, price, currency)}"
+
+
+@dataclass(frozen=True)
+class LevelUpdate:
+    """Ampliar una posición con tesis cuando el stop o el objetivo de la compra no coinciden
+    con los de la tesis (GUIA §5.5): lo que se puede actualizar, en la divisa de los niveles de
+    la compra. La entrada es el nuevo coste medio en esa divisa.
+
+    Si la divisa cambia, los tres números van juntos: una entrada en otra divisa no valdría.
+    """
+
+    thesis: Thesis
+    currency: str
+    entry: Decimal
+    stop: Decimal
+    target: Decimal
+
+    @property
+    def currency_changes(self) -> bool:
+        return self.currency != self.thesis.levels_currency
+
+    @property
+    def stop_changes(self) -> bool:
+        return self.currency_changes or self.stop != self.thesis.stop
+
+    @property
+    def target_changes(self) -> bool:
+        return self.currency_changes or self.target != self.thesis.target
+
+    @property
+    def entry_changes(self) -> bool:
+        return self.currency_changes or self.entry != self.thesis.entry_price
+
+
+def level_update(
+    thesis: Thesis,
+    stop: Decimal,
+    target: Decimal,
+    currency: str,
+    avg_cost_eur: Decimal,
+    levels_to_eur: Decimal,
+) -> LevelUpdate | None:
+    """Lo que se pregunta al ampliar una posición con tesis. None si el stop y el objetivo de
+    la compra coinciden con los de la tesis (en su misma divisa): no hay nada que preguntar."""
+    if (
+        currency == thesis.levels_currency
+        and stop == thesis.stop
+        and target == thesis.target
+    ):
+        return None
+    return LevelUpdate(thesis, currency, to_levels(avg_cost_eur, levels_to_eur), stop, target)
+
+
+@dataclass(frozen=True)
+class LevelChoice:
+    """Qué decide actualizar el usuario al ampliar (con otra divisa, o todo o nada)."""
+
+    entry: bool = False
+    stop: bool = False
+    target: bool = False
+
+    @property
+    def any(self) -> bool:
+        return self.entry or self.stop or self.target
+
+
+def chosen_levels(update: LevelUpdate, choice: LevelChoice) -> dict[str, Any]:
+    """Los números de la tesis tras la decisión: entrada, stop, objetivo y divisa."""
+    t = update.thesis
+    if update.currency_changes:
+        if not choice.any:
+            return levels_of(t)
+        return {**levels_of(t), "entrada": str(update.entry), "stop": str(update.stop),
+                "objetivo": str(update.target), "divisa": update.currency}
+    return {
+        **levels_of(t),
+        "entrada": str(update.entry) if choice.entry else _text_decimal(t.entry_price),
+        "stop": str(update.stop) if choice.stop else _text_decimal(t.stop),
+        "objetivo": str(update.target) if choice.target else _text_decimal(t.target),
+    }
+
+
+def enlarge_reason(day: date, units: Decimal, price: Decimal, currency: str) -> str:
+    """El motivo del cambio de niveles al ampliar: «Ampliación: compra del 25/09/2026: …»."""
+    return f"Ampliación: {trade_text(day, units, price, currency)}"
+
+
+def kept_levels_text(update: LevelUpdate, day: date, units: Decimal, price: Decimal,
+                     currency: str) -> str:
+    """La nota del historial cuando el usuario amplía y mantiene los niveles de la tesis."""
+    return (
+        "Ampliación: mantienes los niveles de la tesis\n"
+        f"En la {trade_text(day, units, price, currency)}, con stop "
+        f"{format_level(update.stop, update.currency)} y objetivo "
+        f"{format_level(update.target, update.currency)}."
+    )
+
+
+def close_reason(
+    day: date, stop_hit: tuple[Decimal, Decimal] | None, user_reason: str = ""
+) -> str:
+    """El motivo del cierre de una tesis al venderlo todo (GUIA §5.5). `stop_hit`, si hoy saltó
+    su stop: (precio, stop) por unidad y en EUR."""
+    texto = f"Venta total el {day:%d/%m/%Y}."
+    if stop_hit is not None:
+        precio, stop = stop_hit
+        texto += (
+            f" Hoy saltó su stop: cotizaba a {format_eur_price(precio)} con el stop en "
+            f"{format_eur_price(stop)}."
+        )
+    if user_reason.strip():
+        texto += f" Motivo: {user_reason.strip()}"
+    return texto
+
+
+def close_event_text(pnl_eur: Decimal, reason: str) -> str:
+    """El texto del evento de cierre: el PnL realizado y el motivo."""
+    return f"PnL realizado {format_signed_amount(pnl_eur)} €. {reason}"
