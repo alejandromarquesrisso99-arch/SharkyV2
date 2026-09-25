@@ -1,8 +1,9 @@
 """Las siete secciones de la ventana (GUIA §5.10).
 
 Las que todavía no tienen su hito están vacías a propósito: cada una dice qué vivirá en ella y
-en qué hito llega. Ya funcionan Cartera (H5, en ui/portfolio.py) y Ajustes, con Apariencia (el
-tema), Datos (copia de seguridad y restauración, H3) y Acerca de (la versión).
+en qué hito llega. Ya funcionan Panel (H6, en ui/panel.py), Cartera (H5, en ui/portfolio.py) y
+Ajustes, con Apariencia (el tema), Datos (copia de seguridad y restauración, H3) y Acerca de
+(la versión).
 """
 
 from __future__ import annotations
@@ -140,13 +141,22 @@ def state_label(text: str = "", state: str = "muted") -> QLabel:
     return etiqueta
 
 
+def restyle(widget: QWidget, name: str) -> None:
+    """Cambia el nombre de objeto (el estilo que le toca en la hoja de estilo) y lo vuelve a
+    pintar, con sus hijos: `QFrame#chipWarn QLabel` depende del nombre del padre."""
+    if widget.objectName() == name:
+        return
+    widget.setObjectName(name)
+    for w in (widget, *widget.findChildren(QWidget)):
+        w.style().unpolish(w)
+        w.style().polish(w)
+        w.update()
+
+
 def set_state(label: QLabel, text: str, state: str) -> None:
     """Cambia el texto y el estado de una línea; sin texto, se oculta."""
     label.setText(text)
-    if label.objectName() != state:
-        label.setObjectName(state)
-        label.style().unpolish(label)
-        label.style().polish(label)
+    restyle(label, state)
     label.setVisible(bool(text))
 
 
@@ -500,13 +510,24 @@ def build_page(
     fx: FxProvider | None = None,
     settings: Settings | None = None,
     now: Callable[[], datetime] | None = None,
+    refresher: Any | None = None,
 ) -> QWidget:
-    """La página de una sección. Cartera necesita la base de datos y el mercado."""
+    """La página de una sección. Panel y Cartera necesitan la base de datos y el mercado, y
+    comparten `refresher` (un `PriceRefresher`): la misma descarga y la misma hora de mercado."""
     if section.key == "ajustes":
         return SettingsPage(section, theme, version, db=db)
-    if section.key == "cartera" and db is not None and market is not None and fx is not None:
-        from sharky.ui.portfolio import PortfolioPage  # portfolio usa las piezas de aquí
+    con_mercado = db is not None and market is not None and fx is not None
+    if section.key in ("panel", "cartera") and con_mercado:
+        # panel y portfolio usan las piezas de aquí: se importan al hacer falta.
+        from sharky.ui.portfolio import PortfolioPage, PriceRefresher
 
         extra = {"now": now} if now is not None else {}
-        return PortfolioPage(db, theme, market, fx, settings=settings, **extra)
+        if section.key == "cartera":
+            return PortfolioPage(
+                db, theme, market, fx, settings=settings, refresher=refresher, **extra
+            )
+        from sharky.ui.panel import PanelPage
+
+        actualizador = refresher or PriceRefresher(db, market, fx, settings=settings, **extra)
+        return PanelPage(db, theme, actualizador, settings=settings, **extra)
     return PlaceholderPage(section)

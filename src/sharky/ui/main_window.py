@@ -1,4 +1,8 @@
-"""Ventana principal: lateral con las siete secciones y contenido a la derecha."""
+"""Ventana principal: lateral con las siete secciones y contenido a la derecha.
+
+Abajo del lateral, siempre visibles, el estado del mandato y la hora del último control; en el
+botón del Panel, cuántas cosas requieren atención. Todo sale del Panel (ui/panel.py).
+"""
 
 from __future__ import annotations
 
@@ -15,17 +19,21 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from sharky import paths
+from sharky.core.formatting import format_pct
+from sharky.core.mandate import STATE_LABELS, STATE_TOKENS
 from sharky.services.db import Database
-from sharky.services.market import FxProvider, PriceProvider
+from sharky.services.market import FxProvider, PriceProvider, local_now
 from sharky.services.settings import Settings
-from sharky.ui.pages import SECTIONS, Section, SettingsPage, build_page
+from sharky.ui.pages import SECTIONS, Section, SettingsPage, build_page, restyle
+from sharky.ui.panel import TOKEN_STYLE, PanelPage, day_text, short_when
+from sharky.ui.portfolio import PortfolioPage, PriceRefresher
 from sharky.ui.theme import Theme, ThemeController
 
 log = logging.getLogger(__name__)
@@ -59,10 +67,16 @@ class MainWindow(QMainWindow):
         self._fx = fx
         self._settings = settings
         self._now = now
-        self._buttons: dict[str, QToolButton] = {}
+        self._buttons: dict[str, QPushButton] = {}
         self._pages: dict[str, QWidget] = {}
         #: Botones propios de cada sección, en la cabecera junto al del tema.
         self._actions: dict[str, QWidget] = {}
+        #: La descarga de precios que comparten el Panel y la Cartera.
+        self.refresher: PriceRefresher | None = None
+        if db is not None and market is not None and fx is not None:
+            self.refresher = PriceRefresher(
+                db, market, fx, settings=settings, now=now or local_now, parent=self
+            )
 
         self.setWindowIcon(QIcon(str(paths.icon_path())))
         self.setMinimumSize(1040, 680)
@@ -78,6 +92,11 @@ class MainWindow(QMainWindow):
 
         theme.themeChanged.connect(self._sync_theme_button)
         self._sync_theme_button()
+        panel = self._pages.get("panel")
+        if isinstance(panel, PanelPage):
+            panel.summaryChanged.connect(self._sync_sidebar)
+            panel.navigateRequested.connect(self.navigate)
+        self._sync_sidebar()
         self.show_section(SECTIONS[0].key)
 
     # -- construcción ------------------------------------------------------------------
@@ -119,15 +138,24 @@ class MainWindow(QMainWindow):
         caja.addStretch(1)
         return fila
 
-    def _build_nav_button(self, section: Section) -> QToolButton:
-        boton = QToolButton()
+    def _build_nav_button(self, section: Section) -> QPushButton:
+        boton = QPushButton(section.label)
         boton.setObjectName("navButton")
-        boton.setText(section.label)
         boton.setCheckable(True)
         boton.setAutoExclusive(True)
         boton.setCursor(Qt.CursorShape.PointingHandCursor)
-        boton.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        boton.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         boton.clicked.connect(lambda _checked=False, clave=section.key: self.show_section(clave))
+        if section.key == "panel":
+            # Cuántas cosas requieren atención, a la derecha del botón.
+            fila = QHBoxLayout(boton)
+            fila.setContentsMargins(0, 0, 12, 0)
+            fila.addStretch(1)
+            self.attention_badge = QLabel()
+            self.attention_badge.setObjectName("badgeWarn")
+            self.attention_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.attention_badge.setVisible(False)
+            fila.addWidget(self.attention_badge)
         return boton
 
     def _build_sidebar_footer(self) -> QWidget:
@@ -145,14 +173,14 @@ class MainWindow(QMainWindow):
         titulo.setObjectName("sectionLabel")
         caja.addWidget(titulo)
 
-        chip = QFrame()
-        chip.setObjectName("chip")
-        chip_caja = QVBoxLayout(chip)
+        self._mandate_chip = QFrame()
+        self._mandate_chip.setObjectName("chip")
+        chip_caja = QVBoxLayout(self._mandate_chip)
         chip_caja.setContentsMargins(10, 6, 10, 6)
         self._mandate_label = QLabel("Sin datos todavía")
         self._mandate_label.setWordWrap(True)
         chip_caja.addWidget(self._mandate_label)
-        caja.addWidget(chip)
+        caja.addWidget(self._mandate_chip)
 
         self._last_check_label = QLabel("Último control: —")
         self._last_check_label.setObjectName("muted")
@@ -187,6 +215,7 @@ class MainWindow(QMainWindow):
                 fx=self._fx,
                 settings=self._settings,
                 now=self._now,
+                refresher=self.refresher,
             )
             if isinstance(pagina, SettingsPage):
                 pagina.restartRequested.connect(self.restartRequested)
@@ -225,8 +254,17 @@ class MainWindow(QMainWindow):
         """La página de una sección."""
         return self._pages[key]
 
+    def navigate(self, key: str, ticker: str = "") -> None:
+        """«Ver» del Panel: la sección y, en Cartera, la fila de ese ticker."""
+        self.show_section(key)
+        pagina = self._pages[key]
+        if ticker and isinstance(pagina, PortfolioPage):
+            pagina.select_ticker(ticker)
+
     def shutdown(self) -> None:
         """Al salir: que las páginas corten lo que tengan a medias en segundo plano."""
+        if self.refresher is not None:
+            self.refresher.shutdown()
         for pagina in self._pages.values():
             parar = getattr(pagina, "shutdown", None)
             if callable(parar):
@@ -240,6 +278,36 @@ class MainWindow(QMainWindow):
             self.show()
         self.raise_()
         self.activateWindow()
+
+    def _sync_sidebar(self) -> None:
+        """El estado del mandato, el último control y el recuento del Panel, en el lateral."""
+        panel = self._pages.get("panel")
+        datos = panel.data if isinstance(panel, PanelPage) else None
+        if datos is None:
+            return
+        foto = datos.snapshot
+        token = STATE_TOKENS[foto.state]
+        self._mandate_label.setText(
+            f"{STATE_LABELS[foto.state]} · drawdown {format_pct(foto.drawdown, truncate=True)}"
+        )
+        restyle(self._mandate_chip, f"chip{TOKEN_STYLE[token]}")
+        if datos.held_since is not None:
+            self._mandate_chip.setToolTip(
+                "Valoración no fiable: estado y máximo de "
+                f"{day_text(datos.held_since, datos.today)}."
+            )
+        else:
+            self._mandate_chip.setToolTip("")
+        ahora = (self._now or local_now)()
+        cuando = short_when(datos.last_check, ahora) if datos.last_check else "—"
+        self._last_check_label.setText(f"Último control: {cuando}")
+        n = len(datos.items)
+        self.attention_badge.setText(str(n))
+        self.attention_badge.setToolTip(
+            "1 cosa requiere atención" if n == 1 else f"{n} cosas requieren atención"
+        )
+        restyle(self.attention_badge, f"badge{TOKEN_STYLE[datos.attention_token]}")
+        self.attention_badge.setVisible(n > 0)
 
     def _sync_theme_button(self, *_args: object) -> None:
         oscuro = self._theme.effective is Theme.DARK

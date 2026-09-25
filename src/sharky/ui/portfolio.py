@@ -4,7 +4,9 @@
   de dónde sale el precio (procedencia) y los niveles de su tesis.
 - Exposición por sector frente al tope del mandato, y el efectivo.
 - «Actualizar precios (gratis)» descarga en un hilo de trabajo, con barra de progreso y
-  «Cancelar»: la ventana no se congela.
+  «Cancelar»: la ventana no se congela. La descarga (`PriceRefresher`) es la misma para el
+  Panel y la Cartera, y al terminar deja guardadas la foto del NAV del día y la auditoría del
+  mandato.
 - «Editar activo»: símbolo (con «Probar» y la sugerencia por ISIN), sector y clase.
 
 Todo lo que se enseña sale de `core.valuation`; aquí no se calcula ni un euro.
@@ -25,6 +27,7 @@ from typing import Any
 from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
+    QObject,
     QPersistentModelIndex,
     QPointF,
     QRectF,
@@ -65,7 +68,9 @@ from sharky.core.formatting import (
     format_price,
     format_signed_amount,
     format_units,
+    pretty_sector,
 )
+from sharky.core.mandate import MandateRules
 from sharky.core.models import Asset, AssetClass, PriceSource, Thesis, ThesisStatus
 from sharky.core.valuation import PositionValue, Valuation
 from sharky.services.db import Database
@@ -82,7 +87,12 @@ from sharky.services.market import (
     probe_symbol,
     refresh_market,
 )
-from sharky.services.repositories import AssetRepository, ThesisRepository
+from sharky.services.repositories import (
+    AssetRepository,
+    RecordedValuation,
+    ThesisRepository,
+    record_valuation,
+)
 from sharky.services.settings import Settings
 from sharky.ui import theme as theme_module
 from sharky.ui.pages import card, muted, set_state, state_label
@@ -156,11 +166,6 @@ FIFO_NOTE = (
     "que va por FIFO."
 )
 ROW_HEIGHT = 34
-
-
-def pretty_sector(sector: str) -> str:
-    """«Renta_Variable_Global» → «Renta Variable Global»."""
-    return sector.replace("_", " ")
 
 
 def when(moment: datetime, now: datetime) -> str:
@@ -542,11 +547,11 @@ def footer_text(valuation: Valuation, now: datetime) -> str:
     if total:
         fiables = total - len(valuation.unreliable)
         partes.append(
-            f"Cobertura {format_pct(valuation.coverage)}: {fiables} de {total} posiciones con "
-            "precio fiable (de mercado o guardado hace menos de 24 horas)."
+            f"Cobertura {format_pct(valuation.coverage, truncate=True)}: {fiables} de {total} "
+            "posiciones con precio fiable (de mercado o guardado hace menos de 24 horas)."
         )
     else:
-        partes.append(f"Cobertura {format_pct(valuation.coverage)}.")
+        partes.append(f"Cobertura {format_pct(valuation.coverage, truncate=True)}.")
     if not valuation.reliable:
         partes.append("Por debajo del 90 %: esta valoración no es fiable.")
     for p in valuation.unreliable:
@@ -567,6 +572,7 @@ def footer_text(valuation: Valuation, now: datetime) -> str:
 class RefreshOutcome:
     refresh: MarketRefresh
     valuation: Valuation
+    recorded: RecordedValuation
 
 
 def refresh_and_value(
@@ -574,13 +580,162 @@ def refresh_and_value(
     prices: PriceProvider,
     fx: FxProvider,
     now: Callable[[], datetime],
+    rules: MandateRules,
     progress: Callable[[int, int], None] | None = None,
     cancel: threading.Event | None = None,
 ) -> RefreshOutcome:
-    """Descarga, guarda y valora. Corre en un hilo de trabajo."""
+    """Descarga y guarda los precios, valora y deja la foto del NAV del día y la auditoría del
+    mandato. Corre en un hilo de trabajo."""
     refresco = refresh_market(db, prices, fx, now(), progress, cancel)
-    valoracion = load_valuation(db.connection(), now(), refresco.fetched_at)
-    return RefreshOutcome(refresco, valoracion)
+    momento = now()
+    valoracion = load_valuation(db.connection(), momento, refresco.fetched_at)
+    with db.transaction() as conn:
+        registro = record_valuation(conn, valoracion, rules, momento)
+    return RefreshOutcome(refresco, valoracion, registro)
+
+
+class PriceRefresher(QObject):
+    """«Actualizar precios», compartido por el Panel y la Cartera.
+
+    Una sola descarga a la vez y una sola hora de mercado: lo descargado en la última
+    actualización es MERCADO en las dos pantallas, así el Panel cuadra con la Cartera. Las
+    señales llegan al hilo de la interfaz.
+    """
+
+    started = Signal()
+    progress = Signal(int, int)
+    cancelRequested = Signal()
+    #: Ha terminado bien, con su RefreshOutcome.
+    succeeded = Signal(object)
+    failed = Signal(str)
+    #: Ha terminado, bien o mal (después de `succeeded` o `failed`).
+    stopped = Signal()
+
+    def __init__(
+        self,
+        db: Database,
+        prices: PriceProvider,
+        fx: FxProvider,
+        *,
+        settings: Settings | None = None,
+        now: Callable[[], datetime] = local_now,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._db = db
+        self.prices = prices
+        self.fx = fx
+        self._settings = settings or Settings()
+        self._now = now
+        #: Hora de la última actualización de esta sesión: lo descargado entonces es MERCADO.
+        self.market_at: datetime | None = None
+        self.last_refresh: MarketRefresh | None = None
+        self._cancel: threading.Event | None = None
+        self._worker: Worker | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._worker is not None
+
+    @property
+    def cancelling(self) -> bool:
+        return self._cancel is not None and self._cancel.is_set()
+
+    def rules(self) -> MandateRules:
+        return self._settings.mandate.rules()
+
+    def start(self) -> bool:
+        """Empieza a descargar en un hilo de trabajo. False si ya había una descarga."""
+        if self.running:
+            return False
+        self._cancel = threading.Event()
+        trabajo = Worker(
+            refresh_and_value,
+            self._db,
+            self.prices,
+            self.fx,
+            self._now,
+            self.rules(),
+            cancel=self._cancel,
+        ).pass_progress()
+        trabajo.signals.progress.connect(self._on_progress)
+        trabajo.signals.finished.connect(self._on_done)
+        trabajo.signals.failed.connect(self._on_failed)
+        self._worker = trabajo  # sin referencia, las señales se perderían
+        self.started.emit()
+        start(trabajo)
+        return True
+
+    def cancel(self) -> None:
+        if self._cancel is not None and not self._cancel.is_set():
+            self._cancel.set()
+            self.cancelRequested.emit()
+
+    def shutdown(self) -> None:
+        """Al cerrar la app: que una descarga a medias no la retenga."""
+        if self._cancel is not None:
+            self._cancel.set()
+
+    def _on_progress(self, done: int, total: int) -> None:
+        if not self.cancelling:
+            self.progress.emit(done, total)
+
+    def _on_done(self, outcome: RefreshOutcome) -> None:
+        self.last_refresh = outcome.refresh
+        self.market_at = outcome.refresh.fetched_at
+        self._worker = None
+        self._cancel = None
+        self.succeeded.emit(outcome)
+        self.stopped.emit()
+
+    def _on_failed(self, message: str) -> None:
+        self._worker = None
+        self._cancel = None
+        self.failed.emit(message)
+        self.stopped.emit()
+
+
+class RefreshProgress(QFrame):
+    """La barra de «Actualizar precios» con «Cancelar». Se enseña sola mientras dura."""
+
+    def __init__(self, refresher: PriceRefresher, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+        fila = QHBoxLayout(self)
+        fila.setContentsMargins(16, 10, 16, 10)
+        fila.setSpacing(12)
+        self.label = QLabel("Descargando precios…")
+        fila.addWidget(self.label)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setRange(0, 0)
+        fila.addWidget(self.bar, 1)
+        self.cancel_button = QPushButton("Cancelar")
+        self.cancel_button.clicked.connect(refresher.cancel)
+        fila.addWidget(self.cancel_button)
+        self.setVisible(False)
+        refresher.started.connect(self._on_started)
+        refresher.progress.connect(self._on_progress)
+        refresher.cancelRequested.connect(self._on_cancelling)
+        refresher.stopped.connect(self._on_stopped)
+
+    def _on_started(self) -> None:
+        self.bar.setRange(0, 0)
+        self.label.setText("Descargando precios…")
+        self.cancel_button.setEnabled(True)
+        self.setVisible(True)
+
+    def _on_progress(self, done: int, total: int) -> None:
+        self.bar.setRange(0, max(1, total))
+        self.bar.setValue(done)
+        self.label.setText(f"Descargando precios: {done} de {total}…")
+
+    def _on_cancelling(self) -> None:
+        self.cancel_button.setEnabled(False)
+        self.label.setText("Cancelando…")
+
+    def _on_stopped(self) -> None:
+        self.setVisible(False)
 
 
 # -- la página --------------------------------------------------------------------------
@@ -601,6 +756,7 @@ class PortfolioPage(QWidget):
         *,
         settings: Settings | None = None,
         now: Callable[[], datetime] = local_now,
+        refresher: PriceRefresher | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -610,11 +766,10 @@ class PortfolioPage(QWidget):
         self._fx = fx
         self._settings = settings or Settings()
         self._now = now
-        self._market_at: datetime | None = None
-        self._cancel: threading.Event | None = None
-        self._worker: Worker | None = None
+        self._refresher = refresher or PriceRefresher(
+            db, prices, fx, settings=self._settings, now=now, parent=self
+        )
         self.valuation: Valuation | None = None
-        self.last_refresh: MarketRefresh | None = None
 
         self.header_actions = self._build_actions()
 
@@ -673,21 +828,15 @@ class PortfolioPage(QWidget):
         return acciones
 
     def _build_progress(self) -> QWidget:
-        self.progress_box = QFrame()
-        self.progress_box.setObjectName("card")
-        fila = QHBoxLayout(self.progress_box)
-        fila.setContentsMargins(16, 10, 16, 10)
-        fila.setSpacing(12)
-        self.progress_label = QLabel("Descargando precios…")
-        fila.addWidget(self.progress_label)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setRange(0, 0)
-        fila.addWidget(self.progress_bar, 1)
-        self.cancel_button = QPushButton("Cancelar")
-        self.cancel_button.clicked.connect(self.cancel_refresh)
-        fila.addWidget(self.cancel_button)
-        self.progress_box.setVisible(False)
+        self.progress_box = RefreshProgress(self._refresher)
+        self.progress_label = self.progress_box.label
+        self.progress_bar = self.progress_box.bar
+        self.cancel_button = self.progress_box.cancel_button
+        r = self._refresher
+        r.started.connect(self._on_refresh_started)
+        r.succeeded.connect(self._on_refresh_done)
+        r.failed.connect(self._on_refresh_failed)
+        r.stopped.connect(self._finish_refresh)
         return self.progress_box
 
     def _build_table_card(self) -> QFrame:
@@ -738,7 +887,9 @@ class PortfolioPage(QWidget):
 
     def reload(self) -> None:
         """Vuelve a valorar con lo guardado (sin descargar nada)."""
-        valoracion = load_valuation(self._db.connection(), self._now(), self._market_at)
+        valoracion = load_valuation(
+            self._db.connection(), self._now(), self._refresher.market_at
+        )
         self._show(valoracion)
 
     def _show(self, valuation: Valuation) -> None:
@@ -789,7 +940,15 @@ class PortfolioPage(QWidget):
 
     @property
     def refreshing(self) -> bool:
-        return self._worker is not None
+        return self._refresher.running
+
+    @property
+    def refresher(self) -> PriceRefresher:
+        return self._refresher
+
+    @property
+    def last_refresh(self) -> MarketRefresh | None:
+        return self._refresher.last_refresh
 
     def _update_buttons(self, *_args: object) -> None:
         self.refresh_button.setEnabled(not self.refreshing)
@@ -807,59 +966,29 @@ class PortfolioPage(QWidget):
 
     def start_refresh(self) -> None:
         """«Actualizar precios»: en un hilo de trabajo, con progreso y «Cancelar»."""
-        if self.refreshing:
-            return
-        self._cancel = threading.Event()
-        trabajo = Worker(
-            refresh_and_value, self._db, self._prices, self._fx, self._now, cancel=self._cancel
-        ).pass_progress()
-        trabajo.signals.progress.connect(self._on_progress)
-        trabajo.signals.finished.connect(self._on_refresh_done)
-        trabajo.signals.failed.connect(self._on_refresh_failed)
-        self._worker = trabajo
-        self.progress_bar.setRange(0, 0)
-        self.progress_label.setText("Descargando precios…")
-        self.cancel_button.setEnabled(True)
-        self.progress_box.setVisible(True)
-        self._show_messages([])
-        self._update_buttons()
-        start(trabajo)
+        self._refresher.start()
 
     def cancel_refresh(self) -> None:
-        if self._cancel is not None:
-            self._cancel.set()
-            self.cancel_button.setEnabled(False)
-            self.progress_label.setText("Cancelando…")
+        self._refresher.cancel()
 
     def shutdown(self) -> None:
         """Al cerrar la app: que una descarga a medias no la retenga."""
-        if self._cancel is not None:
-            self._cancel.set()
+        self._refresher.shutdown()
 
-    def _on_progress(self, done: int, total: int) -> None:
-        if self._cancel is not None and self._cancel.is_set():
-            return
-        self.progress_bar.setRange(0, max(1, total))
-        self.progress_bar.setValue(done)
-        self.progress_label.setText(f"Descargando precios: {done} de {total}…")
+    def _on_refresh_started(self) -> None:
+        self._show_messages([])
+        self._update_buttons()
 
     def _finish_refresh(self) -> None:
-        self._worker = None
-        self._cancel = None
-        self.progress_box.setVisible(False)
         self._update_buttons()
         self.refreshFinished.emit()
 
     def _on_refresh_done(self, outcome: RefreshOutcome) -> None:
-        self.last_refresh = outcome.refresh
-        self._market_at = outcome.refresh.fetched_at
         self._show(outcome.valuation)
         self._show_messages(outcome.refresh.messages)
-        self._finish_refresh()
 
     def _on_refresh_failed(self, message: str) -> None:
         self._show_messages([f"No se han podido actualizar los precios: {message}"], "dangerBox")
-        self._finish_refresh()
 
     # -- editar un activo --------------------------------------------------------------
 

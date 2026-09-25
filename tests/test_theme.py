@@ -161,3 +161,11 @@ def test_retener_el_tema_deja_el_cambio_para_despues(qapp, monkeypatch):
         pass
     assert avisos == [str(otro)]  # sin cambios pendientes, salir no aplica nada
     apply_theme(qapp, Theme.LIGHT)
+
+
+@pytest.mark.parametrize("tema", [Theme.LIGHT, Theme.DARK])
+@pytest.mark.parametrize("estado", ["warn", "danger"])
+def test_el_recuento_del_lateral_contrasta(tema, estado):
+    """El número de «Requiere atención» va en el color de superficie sobre ámbar o rojo."""
+    tokens = theme.TOKENS[tema]
+    assert contraste(tokens["surface"], tokens[estado]) >= CONTRASTE_MINIMO

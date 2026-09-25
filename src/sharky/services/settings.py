@@ -17,12 +17,14 @@ import os
 import tempfile
 import time
 from contextlib import suppress
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from sharky import paths
+from sharky.core.mandate import MandateRules
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,24 @@ class MandateSettings(_Section):
         if self.min_cash_optimal_pct > self.max_cash_optimal_pct:
             raise ValueError("el efectivo mínimo en Óptimo no puede superar al máximo")
         return self
+
+    def rules(self) -> MandateRules:
+        """Las reglas para core, en fracciones exactas: 10.0 → Decimal("0.1")."""
+
+        def fraccion(porcentaje: float) -> Decimal:
+            return Decimal(repr(porcentaje)) / 100
+
+        return MandateRules(
+            max_asset_weight_optimal=fraccion(self.max_asset_weight_optimal_pct),
+            max_asset_weight_other=fraccion(self.max_asset_weight_other_pct),
+            max_sector_weight=fraccion(self.max_sector_weight_pct),
+            min_cash_optimal=fraccion(self.min_cash_optimal_pct),
+            max_cash_optimal=fraccion(self.max_cash_optimal_pct),
+            min_cash_other=fraccion(self.min_cash_other_pct),
+            max_risk_per_trade=fraccion(self.max_risk_per_trade_pct),
+            min_reward_risk=Decimal(repr(self.min_reward_risk)),
+            escalation_days=self.breach_escalation_days,
+        )
 
 
 class ActionAI(_Section):

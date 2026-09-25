@@ -111,3 +111,29 @@ def test_porcentaje_sin_decimales():
 )
 def test_importes_con_signo(valor, texto):
     assert format_signed_amount(D(valor)) == texto
+
+
+def test_euros_enteros_para_las_cifras_aproximadas():
+    assert format_eur(D("711.3"), 0) == "711 €"
+    assert format_eur(D("1800"), 0) == "1.800 €"
+
+
+@pytest.mark.parametrize(
+    ("valor", "cortado", "redondeado"),
+    [("0.0299", "2,9 %", "3,0 %"), ("0.03", "3,0 %", "3,0 %"), ("0.19999", "19,9 %", "20,0 %")],
+)
+def test_porcentaje_cortado_sin_redondear(valor, cortado, redondeado):
+    assert format_pct(D(valor), truncate=True) == cortado
+    assert format_pct(D(valor)) == redondeado
+
+
+def test_limites_y_cifras():
+    from sharky.core.formatting import format_limit_pct, format_number, pretty_sector
+
+    assert format_limit_pct(D("0.10")) == "10 %"
+    assert format_limit_pct(D("0.015")) == "1,5 %"
+    assert format_limit_pct(D("0.125")) == "12,5 %"
+    assert format_number(D("1.998"), 2, truncate=True) == "1,99"
+    assert format_number(D("1.998"), 2) == "2,00"
+    assert format_number(D("2"), 1) == "2,0"
+    assert pretty_sector("Renta_Variable_Global") == "Renta Variable Global"

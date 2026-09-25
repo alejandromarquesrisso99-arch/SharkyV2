@@ -19,7 +19,8 @@ import json
 import sqlite3
 import types
 import typing
-from dataclasses import fields
+from collections.abc import Iterable
+from dataclasses import dataclass, fields
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -28,6 +29,7 @@ from typing import Any
 
 from sharky.core.csv_import import Opening
 from sharky.core.ledger import cash_balance
+from sharky.core.mandate import Finding, MandateRules, audit, snapshot_for
 from sharky.core.models import (
     AlertStatus,
     Asset,
@@ -47,6 +49,7 @@ from sharky.core.models import (
     Trade,
     WatchlistItem,
 )
+from sharky.core.valuation import Valuation
 
 
 class NotInTransactionError(RuntimeError):
@@ -347,6 +350,35 @@ class BreachRepository(_Repository):
     def list_open(self) -> list[Breach]:
         return self._select("is_open = 1", order="opened_at, id")
 
+    def list_all(self) -> list[Breach]:
+        return self._select(order="opened_at, id")
+
+    def sync(self, keys: Iterable[tuple[str, str]], now: datetime) -> list[Breach]:
+        """Deja abiertos justo los incumplimientos `(regla, sujeto)` de la última auditoría.
+
+        Los que ya estaban abiertos conservan su fecha de apertura (así se sabe cuántos días
+        llevan) y se anotan como vistos ahora; los nuevos se abren ahora; los que ya no están se
+        cierran. Un incumplimiento que vuelve después de cerrarse es uno nuevo. Devuelve los
+        abiertos.
+        """
+        _require_transaction(self.conn)
+        abiertos = {(b.rule, b.subject): b for b in self.list_open()}
+        vistos = dict.fromkeys(keys)
+        for clave in vistos:
+            existente = abiertos.get(clave)
+            if existente is not None:
+                self.conn.execute(
+                    "UPDATE breaches SET last_seen_at = ? WHERE id = ?",
+                    (to_db(now), existente.id),
+                )
+            else:
+                regla, sujeto = clave
+                self.add(Breach(regla, sujeto, opened_at=now, last_seen_at=now))
+        for clave, existente in abiertos.items():
+            if clave not in vistos:
+                self.conn.execute("UPDATE breaches SET is_open = 0 WHERE id = ?", (existente.id,))
+        return self.list_open()
+
 
 class WatchlistRepository(_Repository):
     table, record = "watchlist", WatchlistItem
@@ -430,6 +462,37 @@ def create_portfolio(conn: sqlite3.Connection, opening: Opening) -> None:
         operaciones.add(operacion)
     CashMovementRepository(conn).add(opening.initial_cash)
     NavSnapshotRepository(conn).save(opening.snapshot)
+
+
+@dataclass(frozen=True)
+class RecordedValuation:
+    """Lo que ha dejado guardado una valoración: su foto del NAV y la auditoría."""
+
+    snapshot: NavSnapshot
+    saved: bool  # False si ya había una foto fiable de ese día y esta no lo es
+    findings: tuple[Finding, ...]
+    breaches: tuple[Breach, ...]  # los abiertos tras auditar
+
+
+def record_valuation(
+    conn: sqlite3.Connection, valuation: Valuation, rules: MandateRules, now: datetime
+) -> RecordedValuation:
+    """Guarda la foto del NAV del día y la auditoría del mandato (GUIA §5.4). Va dentro de la
+    transacción de quien llama.
+
+    Una foto por día: la última valoración fiable sustituye a la anterior; una no fiable no
+    sustituye a una fiable. La auditoría se hace con el estado de la foto (el vigente, o el
+    que se mantiene si la valoración no es fiable).
+    """
+    _require_transaction(conn)
+    fotos = NavSnapshotRepository(conn)
+    foto = snapshot_for(
+        now.date(), valuation, fotos.list_all(), CashMovementRepository(conn).list_all()
+    )
+    guardada = fotos.save(foto)
+    hallazgos = audit(valuation, foto.state, rules)
+    abiertos = BreachRepository(conn).sync((h.key for h in hallazgos), now)
+    return RecordedValuation(foto, guardada, hallazgos, tuple(abiertos))
 
 
 class RunRepository(_Repository):

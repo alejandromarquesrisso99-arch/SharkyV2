@@ -6,7 +6,7 @@ Y al revés: los campos numéricos aceptan coma o punto como separador decimal.
 from __future__ import annotations
 
 import re
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 
 UNITS_DECIMALS = 6
 PRICE_MIN_DECIMALS = 2
@@ -17,8 +17,14 @@ _DIGITS = re.compile(r"^[+-]?(\d+([.,]\d*)?|[.,]\d+)$")
 _GROUPED = r"^[+-]?\d{{1,3}}(?:{sep}\d{{3}})+(?:{dec}\d*)?$"
 
 
-def _spanish(value: Decimal, decimals: int, trim: bool, min_decimals: int = 0) -> str:
-    redondeado = value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+def _spanish(
+    value: Decimal,
+    decimals: int,
+    trim: bool,
+    min_decimals: int = 0,
+    rounding: str = ROUND_HALF_UP,
+) -> str:
+    redondeado = value.quantize(Decimal(1).scaleb(-decimals), rounding=rounding)
     if redondeado == 0:
         redondeado = abs(redondeado)  # nada de «-0,00»
     texto = f"{redondeado:,.{decimals}f}"  # formato inglés: 1,234.50
@@ -35,14 +41,31 @@ def format_units(value: Decimal) -> str:
     return _spanish(value, UNITS_DECIMALS, trim=True)
 
 
-def format_amount(value: Decimal) -> str:
-    """Importe con dos decimales y sin símbolo: `Decimal("2900")` → «2.900,00»."""
-    return _spanish(value, 2, trim=False)
+def format_amount(value: Decimal, decimals: int = 2) -> str:
+    """Importe sin símbolo, con dos decimales: `Decimal("2900")` → «2.900,00»."""
+    return _spanish(value, decimals, trim=False)
 
 
-def format_eur(value: Decimal) -> str:
-    """Importe en euros: `Decimal("1234.5")` → «1.234,50 €»."""
-    return f"{format_amount(value)} €"
+def format_eur(value: Decimal, decimals: int = 2) -> str:
+    """Importe en euros: `Decimal("1234.5")` → «1.234,50 €». Con `decimals=0`, en euros
+    enteros, para las cifras aproximadas («vender unos 712 €»)."""
+    return f"{format_amount(value, decimals)} €"
+
+
+def format_number(value: Decimal, decimals: int = 2, *, truncate: bool = False) -> str:
+    """Una cifra sin unidad, con sus decimales justos: `Decimal("2.5")` → «2,50». Con
+    `truncate`, los decimales que sobran se cortan en vez de redondearse: 1,999 → «1,99»."""
+    return _spanish(value, decimals, trim=False, rounding=ROUND_DOWN if truncate else ROUND_HALF_UP)
+
+
+def format_limit_pct(fraction: Decimal) -> str:
+    """Un límite del mandato, sin ceros de relleno: 0.10 → «10 %», 0.015 → «1,5 %»."""
+    return f"{_spanish(fraction * 100, 2, trim=True)} %"
+
+
+def pretty_sector(sector: str) -> str:
+    """«Renta_Variable_Global» → «Renta Variable Global»."""
+    return sector.replace("_", " ")
 
 
 def format_price(value: Decimal) -> str:
@@ -62,10 +85,17 @@ def _signed(value: Decimal, decimals: int) -> tuple[str, str]:
     return signo, _spanish(abs(redondeado), decimals, trim=False)
 
 
-def format_pct(fraction: Decimal, decimals: int = 1, *, signed: bool = False) -> str:
+def format_pct(
+    fraction: Decimal, decimals: int = 1, *, signed: bool = False, truncate: bool = False
+) -> str:
     """Una proporción como porcentaje: `Decimal("0.123")` → «12,3 %». Con `signed`, el signo
-    va siempre delante: «+32,7 %», «−4,1 %» (y «0,0 %» si redondea a cero)."""
+    va siempre delante: «+32,7 %», «−4,1 %» (y «0,0 %» si redondea a cero).
+
+    Con `truncate`, los decimales que sobran se cortan: un drawdown de 2,97 % se ve «2,9 %»,
+    nunca «3,0 %» mientras no llegue al 3 %."""
     porcentaje = fraction * 100
+    if truncate:
+        return f"{_spanish(porcentaje, decimals, trim=False, rounding=ROUND_DOWN)} %"
     if not signed:
         return f"{_spanish(porcentaje, decimals, trim=False)} %"
     signo, cifra = _signed(porcentaje, decimals)

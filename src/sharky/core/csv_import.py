@@ -32,6 +32,7 @@ from decimal import Decimal
 from enum import StrEnum
 
 from sharky.core.formatting import parse_decimal
+from sharky.core.mandate import INITIAL_UNIT_VALUE
 from sharky.core.models import (
     Asset,
     AssetClass,
@@ -72,7 +73,6 @@ MIN_COLUMNS = 6
 MAX_BYTES = 1_000_000
 
 OPENING_REASON = "Posición inicial importada del CSV"
-INITIAL_UNIT_VALUE = Decimal("100")
 
 _TICKER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ISIN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")

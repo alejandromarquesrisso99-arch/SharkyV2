@@ -11,12 +11,13 @@ La especificación completa y única del proyecto es [GUIA_SHARKY.md](GUIA_SHARK
 
 ## Estado
 
-En construcción. Último hito cerrado: **H5 — Precios y Cartera** (precios reales de Yahoo
-Finance por lotes y con reintentos, tipos de cambio a euros, procedencia de cada precio,
-cobertura, pantalla Cartera con la exposición por sector y «Editar activo»). Antes: asistente
-de primer arranque, base de datos con migraciones, libro derivado de las operaciones, ajustes,
-clave en el Administrador de credenciales, copias de seguridad, ventana con las siete
-secciones, temas claro y oscuro, autocomprobación, ejecutable, instalador y CI.
+En construcción. Último hito cerrado: **H6 — Mandato y Panel** (estados del mandato por el
+drawdown del valor por participación, foto diaria del patrimonio, auditoría con la corrección
+en euros, validación de compras y pantalla Panel con su gráfico). Antes: precios reales de
+Yahoo Finance y pantalla Cartera, asistente de primer arranque, base de datos con migraciones,
+libro derivado de las operaciones, ajustes, clave en el Administrador de credenciales, copias
+de seguridad, ventana con las siete secciones, temas claro y oscuro, autocomprobación,
+ejecutable, instalador y CI.
 
 ## Primer arranque
 
@@ -59,6 +60,37 @@ declarada, manda Yahoo: se corrige y se avisa.
 «Editar activo» cambia el símbolo de Yahoo (con «Probar», que enseña su último cierre, y
 «Sugerir por ISIN»), el sector y la clase. Al cambiar el símbolo se borran los precios
 guardados de ese activo, porque eran de otro valor.
+
+## Mandato y Panel
+
+El drawdown se mide como en un fondo: sobre el **valor por participación**, que empieza en 100,
+frente a su máximo. Ingresos y retiradas cambian el número de participaciones, no su valor:
+meter o sacar dinero no es ganar ni perder. Dividendos, intereses, comisiones, impuestos y
+ajustes sí cuentan. La primera valoración fiable fija el 100, así lo ganado o perdido antes de
+Sharky no cuenta como caída.
+
+| Estado | Drawdown | Compras |
+| :--- | :--- | :--- |
+| Óptimo | menos del 3 % | Permitidas (tope del 10 % por activo) |
+| Alerta | del 3 % a menos del 8 % | Permitidas, con tope del 5 % por activo |
+| Cuidados intensivos | del 8 % a menos del 20 % | Prohibidas (vender siempre se puede) |
+| Bloqueo | 20 % o más | Prohibidas; revisión completa de la cartera |
+
+Las fronteras son exactas y el drawdown se enseña cortado, sin redondear: un 2,97 % se ve
+«2,9 %» y sigue siendo Óptimo. El estado y el máximo solo cambian con una valoración fiable
+(cobertura del 90 % o más); si no, se mantienen los anteriores y el Panel lo avisa.
+
+Cada «Actualizar precios», desde el Panel o desde la Cartera (es la misma descarga), guarda la
+foto del patrimonio del día y audita el mandato: peso por activo y por sector (las posiciones
+sin sector cuentan juntas), efectivo frente a su banda y cobertura, cada incumplimiento con su
+corrección en euros («Reducir ASML al 10 %: vender unos 712 €») y los días que lleva abierto;
+a los 7 días, escalado.
+
+El **Panel** enseña el estado con su barra (marcas en 3, 8 y 20 %), el patrimonio con su
+variación del día, el efectivo frente a su banda, «Requiere atención» con «Ver» y el gráfico
+del valor por participación. En el lateral, siempre a la vista, el estado, la hora del último
+control y cuántas cosas requieren atención. Las tarjetas de los informes y del radar dicen
+«Próximamente» hasta sus hitos.
 
 ## Requisitos de desarrollo
 

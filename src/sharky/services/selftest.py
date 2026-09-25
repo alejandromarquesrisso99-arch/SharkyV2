@@ -2,9 +2,9 @@
 
 Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, la base de
 datos (esquema, migraciones, copia y restauración), los ajustes, la plantilla CSV del asistente,
-los precios y la valoración (con un Yahoo simulado), el Administrador de credenciales, las
-bibliotecas de mercado e IA y los recursos del paquete. Todo lo que escribe va a una carpeta
-temporal: nunca toca los datos del usuario ni su clave.
+los precios y la valoración (con un Yahoo simulado), el mandato y la foto del NAV, el
+Administrador de credenciales, las bibliotecas de mercado e IA y los recursos del paquete. Todo
+lo que escribe va a una carpeta temporal: nunca toca los datos del usuario ni su clave.
 Con `--online` añade una cotización real con su tipo de cambio y una conexión TLS con la API
 de Claude.
 
@@ -405,6 +405,67 @@ def _check_market() -> str:
     )
 
 
+def _check_mandate() -> str:
+    """H6: los estados en sus fronteras exactas, un ingreso que no mueve el valor por
+    participación y la foto del día con su auditoría, guardadas en una base de datos temporal."""
+    from sharky.core.mandate import snapshot_for, state_for
+    from sharky.core.models import CashKind, CashMovement, MandateState, NavSnapshot
+    from sharky.core.valuation import Valuation
+    from sharky.services.db import Database
+    from sharky.services.repositories import (
+        CashMovementRepository,
+        NavSnapshotRepository,
+        record_valuation,
+    )
+    from sharky.services.settings import MandateSettings
+
+    fronteras = {
+        "0.0299": MandateState.OPTIMAL,
+        "0.03": MandateState.ALERT,
+        "0.0799": MandateState.ALERT,
+        "0.08": MandateState.INTENSIVE_CARE,
+        "0.1999": MandateState.INTENSIVE_CARE,
+        "0.20": MandateState.LOCKDOWN,
+    }
+    for caida, estado in fronteras.items():
+        if state_for(Decimal(caida)) is not estado:
+            raise CheckFailure(f"un drawdown de {caida} no da el estado {estado}")
+
+    cien = Decimal("100")
+    ayer, hoy = date(2026, 1, 1), date(2026, 1, 2)
+    ahora = datetime(2026, 1, 2, 18, 0, tzinfo=UTC)
+    base = NavSnapshot(ayer, Decimal("10000"), Decimal("10000"), cien, cien, cien, Decimal("0"),
+                       MandateState.OPTIMAL, Decimal("1"), True)
+    ingreso = CashMovement(hoy, CashKind.DEPOSIT, Decimal("5000"))
+    valoracion = Valuation(ahora, Decimal("15000"), Decimal("15000"), Decimal("1"), (), ())
+    foto = snapshot_for(hoy, valoracion, [base], [ingreso])
+    if foto.unit_value != cien or foto.fund_units != Decimal("150"):
+        raise CheckFailure("un ingreso ha movido el valor por participación")
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_mandate_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+        try:
+            db.migrate()
+            with db.transaction() as conn:
+                NavSnapshotRepository(conn).save(base)
+                CashMovementRepository(conn).add(ingreso)
+                registro = record_valuation(conn, valoracion, MandateSettings().rules(), ahora)
+            guardada = NavSnapshotRepository(db.connection()).get(hoy)
+        finally:
+            db.close_all()
+    if not registro.saved or guardada != registro.snapshot:
+        raise CheckFailure("la foto del NAV del día no se ha guardado")
+    abiertos = {(b.rule, b.subject) for b in registro.breaches}
+    if abiertos != {("EFECTIVO", "MAXIMO")}:  # todo en efectivo: por encima del 30 %
+        raise CheckFailure(f"la auditoría no cuadra: {sorted(abiertos)}")
+    return (
+        "fronteras del drawdown exactas (2,99 / 3 / 7,99 / 8 / 19,99 / 20 %); un ingreso no "
+        "mueve el valor por participación; foto del día e incumplimientos guardados"
+    )
+
+
 def configure_keyring() -> str:
     """Fija el backend de Windows en código: dentro del exe no se descubre solo (GUIA §3)."""
     return secret_store.configure_backend()
@@ -517,6 +578,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Ajustes", _check_settings),
         Check("Plantilla CSV y cartera inicial", _check_csv_template),
         Check("Precios y valoración", _check_market),
+        Check("Mandato y foto del NAV", _check_mandate),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

@@ -32,6 +32,7 @@ from sharky.services.repositories import (
 )
 from sharky.ui.main_window import MainWindow
 from sharky.ui.pages import PlaceholderPage
+from sharky.ui.panel import PanelPage
 from sharky.ui.portfolio import (
     Col,
     EditAssetDialog,
@@ -441,7 +442,12 @@ def test_la_ventana_con_mercado_tiene_cartera_y_sus_botones(qtbot, qapp, cartera
     assert pagina.header_actions.isVisible()
     ventana.show_section("panel")
     assert not pagina.header_actions.isVisible()
-    assert isinstance(ventana.page("panel"), PlaceholderPage)
+    panel = ventana.page("panel")
+    assert isinstance(panel, PanelPage)
+    assert panel.header_actions.isVisible()
+    # Panel y Cartera comparten la misma descarga de precios.
+    assert pagina.refresher is ventana.refresher
+    assert isinstance(ventana.page("operar"), PlaceholderPage)
     ventana.shutdown()
 
 

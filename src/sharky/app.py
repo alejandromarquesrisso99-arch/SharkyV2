@@ -245,6 +245,7 @@ def _check_ui() -> str:
     from sharky.services.selftest import CheckFailure
     from sharky.ui.main_window import MainWindow
     from sharky.ui.pages import SECTIONS
+    from sharky.ui.panel import PanelPage
     from sharky.ui.portfolio import PortfolioPage
     from sharky.ui.theme import Theme, ThemeController
 
@@ -266,17 +267,22 @@ def _check_ui() -> str:
             cartera = ventana.page("cartera")
             if not isinstance(cartera, PortfolioPage):
                 raise CheckFailure("la sección Cartera no se ha construido")
+            panel = ventana.page("panel")
+            if not isinstance(panel, PanelPage) or panel.data is None:
+                raise CheckFailure("el Panel no se ha construido")
             cartera.reload()
+            panel.reload()
             tema.set_theme(Theme.DARK)
             cartera.grab()
+            panel.grab()  # el gráfico del valor por participación (pyqtgraph)
             ventana.close()
             destroy_now(ventana)
             _walk_setup_wizard(db, Path(carpeta))
         finally:
             db.close_all()
     return (
-        f"ventana creada, {len(SECTIONS)} secciones recorridas (Cartera y Ajustes con Datos), "
-        "temas claro y oscuro; asistente recorrido con la plantilla CSV"
+        f"ventana creada, {len(SECTIONS)} secciones recorridas (Panel con su gráfico, Cartera y "
+        "Ajustes con Datos), temas claro y oscuro; asistente recorrido con la plantilla CSV"
     )
 
 

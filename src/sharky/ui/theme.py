@@ -105,12 +105,12 @@ _STYLESHEET = Template(
     QFrame#chip { background-color: $surface; border: 1px solid $border; border-radius: 6px; }
     QFrame#separator { background-color: $border; border: none; max-height: 1px; }
 
-    QToolButton#navButton {
-        background-color: transparent; border: none;
+    QPushButton#navButton {
+        background-color: transparent; border: none; border-radius: 0px;
         border-left: 3px solid transparent; padding: 9px 12px 9px 13px; text-align: left;
     }
-    QToolButton#navButton:hover { background-color: $surface; }
-    QToolButton#navButton:checked {
+    QPushButton#navButton:hover { background-color: $surface; }
+    QPushButton#navButton:checked {
         background-color: $surface_selected; border-left: 3px solid $accent; font-weight: 600;
     }
 
@@ -178,6 +178,47 @@ _STYLESHEET = Template(
         background-color: $surface; color: $text_muted; border: none;
         border-bottom: 1px solid $border; padding: 6px 18px 6px 8px; font-weight: 600;
     }
+
+    QLabel#bigNumber { font-size: 26px; font-weight: 700; }
+    QLabel#stateOk { color: $ok; font-size: 28px; font-weight: 700; }
+    QLabel#stateWarn { color: $warn; font-size: 28px; font-weight: 700; }
+    QLabel#stateDanger { color: $danger; font-size: 28px; font-weight: 700; }
+    QLabel#itemTitle { font-weight: 600; }
+
+    QFrame#chipOk { background-color: $ok_fill; border: 1px solid $ok_line; border-radius: 6px; }
+    QFrame#chipOk QLabel { color: $ok; font-weight: 600; }
+    QFrame#chipWarn {
+        background-color: $warn_fill; border: 1px solid $warn_line; border-radius: 6px;
+    }
+    QFrame#chipWarn QLabel { color: $warn; font-weight: 600; }
+    QFrame#chipDanger {
+        background-color: $danger_fill; border: 1px solid $danger_line; border-radius: 6px;
+    }
+    QFrame#chipDanger QLabel { color: $danger; font-weight: 600; }
+    QLabel#chipNeutral {
+        background-color: $surface_alt; color: $text_muted; border: 1px solid $border;
+        border-radius: 9px; padding: 1px 8px; font-weight: 600;
+    }
+
+    QLabel#badgeDanger, QLabel#badgeWarn {
+        color: $surface; border-radius: 9px; padding: 0px 6px; font-weight: 700;
+        min-height: 18px; max-height: 18px;
+    }
+    QLabel#badgeDanger { background-color: $danger; }
+    QLabel#badgeWarn { background-color: $warn; }
+
+    QLabel#dotDanger, QLabel#dotWarn, QLabel#dotOk {
+        border-radius: 5px; min-width: 10px; max-width: 10px; min-height: 10px; max-height: 10px;
+    }
+    QLabel#dotDanger { background-color: $danger; }
+    QLabel#dotWarn { background-color: $warn; }
+    QLabel#dotOk { background-color: $ok; }
+
+    QPushButton#link {
+        background-color: transparent; color: $accent; border: none; padding: 2px 6px;
+        font-weight: 600;
+    }
+    QPushButton#link:hover { background-color: $surface_selected; }
 
     QScrollArea { background-color: transparent; border: none; }
     QScrollArea > QWidget > QWidget { background-color: transparent; }
@@ -282,8 +323,12 @@ def build_palette(t: Mapping[str, str]) -> QPalette:
 
 
 def build_stylesheet(t: Mapping[str, str]) -> str:
-    """Hoja de estilo a partir de los tokens."""
-    return _STYLESHEET.substitute(t)
+    """Hoja de estilo a partir de los tokens (y de los fondos teñidos que salen de ellos)."""
+    derivados = {}
+    for estado in ("ok", "warn", "danger"):
+        derivados[f"{estado}_fill"] = mix(t["surface"], t[estado], CHIP_FILL)
+        derivados[f"{estado}_line"] = mix(t["surface"], t[estado], CHIP_BORDER)
+    return _STYLESHEET.substitute({**t, **derivados})
 
 
 def apply_theme(app: QApplication, theme: Theme) -> Theme:
