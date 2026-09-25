@@ -2,8 +2,9 @@
 
 Las que todavía no tienen su hito están vacías a propósito: cada una dice qué vivirá en ella y
 en qué hito llega. Ya funcionan Panel (H6, en ui/panel.py), Cartera (H5, en ui/portfolio.py),
-Operar (H8, en ui/trade.py), Tesis (H7, en ui/theses.py) y Ajustes, con Apariencia (el tema),
-Datos (copia de seguridad y restauración, H3) y Acerca de (la versión).
+Operar (H8, en ui/trade.py), Tesis (H7, en ui/theses.py), Informes (H9, en ui/reports.py) y
+Ajustes, con Claude (H9, en ui/settings.py), Apariencia (el tema), Datos (copia de seguridad y
+restauración, H3) y Acerca de (la versión).
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from sharky.services.backup import (
 )
 from sharky.services.db import Database
 from sharky.services.market import FxProvider, PriceProvider
-from sharky.services.settings import Settings
+from sharky.services.settings import Settings, SettingsStore
 from sharky.ui.theme import THEME_LABELS, Theme, ThemeController
 from sharky.ui.workers import Worker, start
 
@@ -414,7 +415,7 @@ class DataCard(QFrame):
 
 
 class SettingsPage(QWidget):
-    """Ajustes: Apariencia, Datos y Acerca de; el resto llega en H13."""
+    """Ajustes: Claude, Apariencia, Datos y Acerca de; el resto llega en H13."""
 
     #: Tras restaurar una copia, la app tiene que reiniciarse.
     restartRequested = Signal()
@@ -427,6 +428,9 @@ class SettingsPage(QWidget):
         parent: QWidget | None = None,
         *,
         db: Database | None = None,
+        settings: Settings | None = None,
+        store: SettingsStore | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         super().__init__(parent)
         self.section = section
@@ -443,6 +447,11 @@ class SettingsPage(QWidget):
         caja.setContentsMargins(0, 0, 0, 0)
         caja.setSpacing(16)
 
+        from sharky.ui.settings import ClaudeCard
+
+        extra = {"now": now} if now is not None else {}
+        self.claude_card = ClaudeCard(settings or Settings(), store, db, **extra)
+        caja.addWidget(self.claude_card)
         caja.addWidget(self._appearance_card())
         self.data_card: DataCard | None = None
         if db is not None:
@@ -511,12 +520,19 @@ def build_page(
     settings: Settings | None = None,
     now: Callable[[], datetime] | None = None,
     refresher: Any | None = None,
+    runner: Any | None = None,
+    store: SettingsStore | None = None,
 ) -> QWidget:
     """La página de una sección. Panel, Cartera, Operar y Tesis necesitan la base de datos y
     el mercado, y comparten `refresher` (un `PriceRefresher`): la misma descarga y la misma hora
-    de mercado."""
+    de mercado. El Panel y los Informes comparten `runner` (un `ReportRunner`)."""
     if section.key == "ajustes":
-        return SettingsPage(section, theme, version, db=db)
+        return SettingsPage(section, theme, version, db=db, settings=settings, store=store,
+                            now=now)
+    if section.key == "informes" and db is not None:
+        from sharky.ui.reports import ReportsPage
+
+        return ReportsPage(db, theme, runner)
     con_mercado = db is not None and market is not None and fx is not None
     if section.key in ("panel", "cartera", "operar", "tesis") and con_mercado:
         # panel, portfolio, trade y theses usan las piezas de aquí: se importan al hacer falta.
@@ -538,5 +554,5 @@ def build_page(
             return TradePage(db, theme, actualizador, settings=settings, **extra)
         from sharky.ui.panel import PanelPage
 
-        return PanelPage(db, theme, actualizador, settings=settings, **extra)
+        return PanelPage(db, theme, actualizador, settings=settings, runner=runner, **extra)
     return PlaceholderPage(section)

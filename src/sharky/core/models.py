@@ -348,7 +348,11 @@ class Report:
 
 @dataclass(frozen=True)
 class Run:
-    """Tabla `runs`: un paso de la rutina."""
+    """Tabla `runs`: un paso de la rutina, o una acción lanzada a mano.
+
+    `cost_usd` es lo que ha costado de verdad en Claude (migración 3), también si falló: los
+    intentos fallidos se cobran igual. El gasto del mes es la suma de esta columna.
+    """
 
     started_at: datetime
     triggered_by: str
@@ -356,4 +360,5 @@ class Run:
     status: RunStatus
     detail: str = ""
     finished_at: datetime | None = None
+    cost_usd: Decimal = Decimal("0")
     id: int | None = None

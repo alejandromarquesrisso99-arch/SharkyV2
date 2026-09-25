@@ -477,7 +477,7 @@ def test_la_migracion_2_da_hora_a_los_tipos_de_cambio(tmp_path):
             )
     finally:
         vieja.close_all()
-    nueva = Database(ruta)
+    nueva = Database(ruta, MIGRATIONS[:2])
     try:
         assert nueva.migrate() == 1
         conn = nueva.connection()

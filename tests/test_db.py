@@ -235,3 +235,30 @@ def test_los_valores_cerrados_se_comprueban(db):
             "INSERT INTO runs (started_at, triggered_by, step, status) "
             "VALUES ('2026-01-02T08:00:00', 'prueba', 'paso', 'QUIZAS')"
         )
+
+
+def test_la_migracion_3_da_coste_al_registro(tmp_path):
+    """H9: el coste de Claude va también en `runs`; lo de antes queda a 0 $."""
+    ruta = tmp_path / "vieja.db"
+    vieja = Database(ruta, MIGRATIONS[:2])
+    try:
+        vieja.migrate()
+        with vieja.transaction() as conn:
+            conn.execute(
+                "INSERT INTO runs (started_at, triggered_by, step, status) "
+                "VALUES ('2026-09-20T08:00:00+02:00', 'arranque', 'Valorar', 'OK')"
+            )
+    finally:
+        vieja.close_all()
+    nueva = Database(ruta)
+    try:
+        assert nueva.migrate() == 1
+        fila = nueva.connection().execute("SELECT cost_usd FROM runs").fetchone()
+        assert fila["cost_usd"] == "0"
+        with pytest.raises(sqlite3.IntegrityError), nueva.transaction() as conn:
+            conn.execute(
+                "INSERT INTO runs (started_at, triggered_by, step, status, cost_usd) "
+                "VALUES ('2026-09-21T08:00:00+02:00', 'manual', 'Informe diario', 'OK', NULL)"
+            )
+    finally:
+        nueva.close_all()

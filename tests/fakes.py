@@ -38,11 +38,67 @@ class FakeKeyring:
         del self.almacen[(servicio, usuario)]
 
 
+#: Lo que contesta el Claude de mentira si no se le ha preparado otra cosa.
+RESPUESTA_POR_DEFECTO = (
+    "SAN cae y se acerca a su stop; el resto apenas se mueve.\n\n"
+    "## Conclusión del día\n"
+    "- Vigilar el stop de SAN.\n"
+)
+
+
+def mensaje_claude(texto: str = RESPUESTA_POR_DEFECTO, *, stop: str = "end_turn",
+                   entrada: int = 2_000, salida: int = 600, razonamiento: bool = False,
+                   busquedas: int = 0, modelo: str = "claude-sonnet-5") -> SimpleNamespace:
+    """Un mensaje final como el de `get_final_message()`: bloques, `stop_reason` y `usage`.
+    Con `razonamiento`, lleva un bloque de razonamiento (vacío, como en Sonnet 5)."""
+    bloques = []
+    if razonamiento:
+        bloques.append(SimpleNamespace(type="thinking", thinking=""))
+    if texto:
+        bloques.append(SimpleNamespace(type="text", text=texto))
+    uso = SimpleNamespace(
+        input_tokens=entrada,
+        output_tokens=salida,
+        server_tool_use=SimpleNamespace(web_search_requests=busquedas) if busquedas else None,
+    )
+    return SimpleNamespace(content=bloques, stop_reason=stop, usage=uso, model=modelo)
+
+
+class FakeStream:
+    """Hace de `MessageStream`: unos cuantos eventos y el mensaje final."""
+
+    def __init__(self, claude: FakeClaude, respuesta: object) -> None:
+        self._claude = claude
+        self._respuesta = respuesta
+
+    def __enter__(self) -> FakeStream:
+        if isinstance(self._respuesta, BaseException):
+            raise self._respuesta
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def __iter__(self):
+        for n in range(3):
+            if self._claude.durante_stream is not None:
+                self._claude.durante_stream(n)
+            yield SimpleNamespace(type="content_block_delta", index=n)
+
+    def get_final_message(self) -> object:
+        return self._respuesta
+
+
 class FakeClaude:
     """Cliente de Claude de mentira: hace de `anthropic.Anthropic` y nunca sale a la red.
 
     Se usa como la clase (se llama con los mismos argumentos) y apunta con qué se creó cada
     cliente y qué se le pidió. Con `error`, `models.list` lanza esa excepción.
+
+    `messages.stream(...)` contesta, por orden, lo que haya en `respuestas` (un mensaje de
+    `mensaje_claude` o una excepción que se lanza al abrir el streaming); si no queda nada, un
+    mensaje con `RESPUESTA_POR_DEFECTO`. `al_llamar(kwargs)` se ejecuta en cada llamada (para
+    mirar la base de datos en ese momento) y `durante_stream(n)` con cada evento.
     """
 
     def __init__(self, error: BaseException | None = None) -> None:
@@ -50,6 +106,10 @@ class FakeClaude:
         self.creados: list[dict] = []
         self.llamadas: list[tuple[str, dict]] = []
         self.cerrados = 0
+        self.respuestas: list[object] = []
+        self.modelos: list[str] = ["claude-sonnet-5"]
+        self.al_llamar = None
+        self.durante_stream = None
 
     def __call__(self, **kwargs: object) -> FakeClaude:
         self.creados.append(kwargs)
@@ -59,11 +119,27 @@ class FakeClaude:
     def models(self) -> FakeClaude:
         return self
 
+    @property
+    def messages(self) -> SimpleNamespace:
+        return SimpleNamespace(stream=self._stream)
+
     def list(self, **kwargs: object) -> list[SimpleNamespace]:
         self.llamadas.append(("models.list", kwargs))
         if self.error is not None:
             raise self.error
-        return [SimpleNamespace(id="claude-sonnet-5")]
+        return [SimpleNamespace(id=m) for m in self.modelos]
+
+    def _stream(self, **kwargs: object) -> FakeStream:
+        self.llamadas.append(("messages.stream", kwargs))
+        if self.al_llamar is not None:
+            self.al_llamar(kwargs)
+        respuesta = self.respuestas.pop(0) if self.respuestas else mensaje_claude()
+        return FakeStream(self, respuesta)
+
+    @property
+    def streams(self) -> list[dict]:
+        """Lo que se pidió en cada `messages.stream`, por orden."""
+        return [kwargs for nombre, kwargs in self.llamadas if nombre == "messages.stream"]
 
     def close(self) -> None:
         self.cerrados += 1
@@ -72,9 +148,11 @@ class FakeClaude:
 _PETICION = httpx2.Request("GET", "https://api.anthropic.com/v1/models")
 
 
-def api_status_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.APIStatusError:
+def api_status_error(cls: type[anthropic.APIStatusError], status: int, body: object = None,
+                     headers: dict | None = None) -> anthropic.APIStatusError:
     """Un error HTTP del SDK, como los que lanza de verdad (401, 403, 429, 500…)."""
-    return cls(f"HTTP {status}", response=httpx2.Response(status, request=_PETICION), body=None)
+    respuesta = httpx2.Response(status, request=_PETICION, headers=headers)
+    return cls(f"HTTP {status}", response=respuesta, body=body)
 
 
 def connection_error() -> anthropic.APIConnectionError:

@@ -58,6 +58,34 @@ def format_number(value: Decimal, decimals: int = 2, *, truncate: bool = False) 
     return _spanish(value, decimals, trim=False, rounding=ROUND_DOWN if truncate else ROUND_HALF_UP)
 
 
+#: Por debajo de un céntimo, el coste de Claude no se redondea a «0,00 $»: se ve «< 0,01 $».
+_CENT = Decimal("0.01")
+
+
+def format_usd(value: Decimal) -> str:
+    """Lo que cuesta Claude, en dólares: `Decimal("0.0312")` → «0,03 $». Un coste que no llega
+    al céntimo se ve «< 0,01 $», nunca «0,00 $» (no es gratis)."""
+    if 0 < value < _CENT / 2:
+        return f"< {format_amount(_CENT)} $"
+    return f"{format_amount(value)} $"
+
+
+def format_usd_range(low: Decimal, high: Decimal) -> str:
+    """Una horquilla de coste: «0,02–0,05 $»."""
+    return f"{format_amount(low)}–{format_amount(high)} $"
+
+
+MONTH_NAMES: tuple[str, ...] = (
+    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
+    "octubre", "noviembre", "diciembre",
+)
+
+
+def month_name(month: int) -> str:
+    """El nombre del mes en español: 9 → «septiembre»."""
+    return MONTH_NAMES[month - 1]
+
+
 def format_limit_pct(fraction: Decimal) -> str:
     """Un límite del mandato, sin ceros de relleno: 0.10 → «10 %», 0.015 → «1,5 %»."""
     return f"{_spanish(fraction * 100, 2, trim=True)} %"

@@ -3,8 +3,9 @@
 Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, la base de
 datos (esquema, migraciones, copia y restauración), los ajustes, la plantilla CSV del asistente,
 los precios y la valoración (con un Yahoo simulado), el mandato y la foto del NAV, las tesis y
-la vigilancia de sus niveles, el Administrador de credenciales, las bibliotecas de mercado e IA
-y los recursos del paquete. Todo
+la vigilancia de sus niveles, las operaciones, el control diario con Claude (con una respuesta
+servida en local), el Administrador de credenciales, las bibliotecas de mercado e IA y los
+recursos del paquete. Todo
 lo que escribe va a una carpeta temporal: nunca toca los datos del usuario ni su clave.
 Con `--online` añade una cotización real con su tipo de cambio y una conexión TLS con la API
 de Claude.
@@ -569,6 +570,152 @@ def _check_trades() -> str:
     )
 
 
+#: Una respuesta de Claude por streaming (SSE), como la de verdad, para servirla en local.
+_CLAUDE_SSE = "".join(
+    f"event: {evento}\ndata: {datos}\n\n"
+    for evento, datos in (
+        ("message_start", '{"type":"message_start","message":{"id":"msg_autocomprobacion",'
+                          '"type":"message","role":"assistant","model":"claude-sonnet-5",'
+                          '"content":[],"stop_reason":null,"stop_sequence":null,'
+                          '"usage":{"input_tokens":1500,"output_tokens":1}}}'),
+        ("content_block_start", '{"type":"content_block_start","index":0,'
+                                '"content_block":{"type":"thinking","thinking":"",'
+                                '"signature":""}}'),
+        ("content_block_stop", '{"type":"content_block_stop","index":0}'),
+        ("content_block_start", '{"type":"content_block_start","index":1,'
+                                '"content_block":{"type":"text","text":""}}'),
+        ("content_block_delta", '{"type":"content_block_delta","index":1,"delta":'
+                                '{"type":"text_delta","text":"SAN ha tocado su stop. "}}'),
+        ("content_block_delta", '{"type":"content_block_delta","index":1,"delta":'
+                                '{"type":"text_delta","text":"\\n\\n## Conclusi\\u00f3n del '
+                                'd\\u00eda\\n- Salir de SAN."}}'),
+        ("content_block_stop", '{"type":"content_block_stop","index":1}'),
+        ("message_delta", '{"type":"message_delta","delta":{"stop_reason":"end_turn",'
+                          '"stop_sequence":null},"usage":{"output_tokens":500}}'),
+        ("message_stop", '{"type":"message_stop"}'),
+    )
+)
+
+
+def _check_claude() -> str:
+    """H9: los prompts van dentro del programa; el SDK de Claude de verdad procesa una respuesta
+    por streaming servida en local (sin red y sin clave real); y en una base de datos temporal,
+    un control diario con su conclusión y su coste, con el aviso de stop guardado antes de
+    llamar a Claude, y otro sin clave con su etiqueta."""
+    import json
+
+    import anthropic
+    import httpx2
+
+    from sharky.core.models import (
+        Asset,
+        CashKind,
+        CashMovement,
+        Price,
+        PriceSource,
+        Thesis,
+        Trade,
+        TradeKind,
+    )
+    from sharky.core.reports import NO_AI_LABEL
+    from sharky.services.ai import ClaudeClient
+    from sharky.services.db import Database
+    from sharky.services.reports import create_daily_report, render_prompt, system_prompt
+    from sharky.services.repositories import (
+        AssetRepository,
+        CashMovementRepository,
+        LevelAlertRepository,
+        PriceRepository,
+        RunRepository,
+        TradeRepository,
+        create_theses,
+        load_valuation,
+    )
+    from sharky.services.settings import Settings
+
+    d = Decimal
+    ajustes = Settings()
+    sistema = system_prompt(ajustes.mandate.rules())
+    if "Peso máximo por activo: 10 %" not in sistema:
+        raise CheckFailure("el prompt de sistema no lleva el mandato de los ajustes")
+    render_prompt("diario", dict.fromkeys(
+        ("fecha", "estado", "posiciones", "umbral", "movimientos", "niveles", "incumplimientos",
+         "forzadas"), "-",
+    ))
+
+    pedidos: list[dict] = []
+    avisos_al_llamar: list[int] = []
+    hoy = date(2026, 1, 2)
+    ahora = datetime(2026, 1, 2, 18, 0, tzinfo=UTC)
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_claude_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+
+        def responder(peticion: httpx2.Request) -> httpx2.Response:
+            pedidos.append(json.loads(peticion.content))
+            otra = Database(db.path)  # otra conexión: solo ve lo ya confirmado
+            try:
+                avisos_al_llamar.append(len(LevelAlertRepository(otra.connection())
+                                            .list_for_date(hoy)))
+            finally:
+                otra.close_all()
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"},
+                                   content=_CLAUDE_SSE.encode("utf-8"))
+
+        def cliente(clave: str) -> ClaudeClient:
+            http = anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(responder))
+            return ClaudeClient(clave, http_client=http, sdk=anthropic.Client,
+                                wait=lambda _s, _c: None)
+
+        try:
+            db.migrate()
+            with db.transaction() as conn:  # SAN 100 × 4 € con el stop en 4,50 €
+                AssetRepository(conn).add(Asset("SAN", "Banco", "EUR", yahoo_symbol="SAN.MC",
+                                                sector="Banca"))
+                TradeRepository(conn).add(Trade(hoy, "SAN", TradeKind.OPENING, d(100), d(5),
+                                                "EUR", d(1), d(0), d(500)))
+                PriceRepository(conn).save(Price("SAN", hoy, d(4), "EUR", PriceSource.MARKET,
+                                                 ahora))
+                CashMovementRepository(conn).add(CashMovement(hoy, CashKind.INITIAL, d(9000)))
+                create_theses(conn, [Thesis("SAN", "EUR", hoy, entry_price=d(5), stop=d("4.5"),
+                                            target=d(7))], ahora)
+            valoracion = load_valuation(db.connection(), ahora)
+            hecho = create_daily_report(db, valoracion, ajustes, lambda: ahora,
+                                        "sk-ant-autocomprobacion", client_factory=cliente)
+            sin_clave = create_daily_report(db, valoracion, ajustes, lambda: ahora, None)
+            gastado = [r.cost_usd for r in RunRepository(db.connection()).list_recent()]
+        finally:
+            db.close_all()
+
+    informe = hecho.report
+    if not pedidos or pedidos[0].get("stream") is not True:
+        raise CheckFailure("la petición a Claude no ha ido por streaming")
+    if pedidos[0].get("output_config") != {"effort": "low"} or "Mandato vigente" not in str(
+        pedidos[0].get("system")
+    ):
+        raise CheckFailure("la petición a Claude no lleva el esfuerzo o el prompt de sistema")
+    if avisos_al_llamar != [1]:
+        raise CheckFailure("el aviso de stop no estaba guardado antes de llamar a Claude")
+    if not informe.used_ai or informe.conclusion != "- Salir de SAN.":
+        raise CheckFailure(f"el SDK no ha dado el texto de Claude: {informe.error}")
+    # 1.500 × 2 $/M + 500 × 10 $/M
+    if (informe.input_tokens, informe.output_tokens) != (1500, 500) or informe.cost_usd != d(
+        "0.008"
+    ):
+        raise CheckFailure("el coste del control diario no cuadra con sus tokens")
+    if sin_clave.report.used_ai or NO_AI_LABEL not in sin_clave.report.markdown:
+        raise CheckFailure("sin clave, el informe no lleva su etiqueta")
+    if sorted(gastado) != [d(0), d("0.008")]:
+        raise CheckFailure("el Registro no guarda el coste real de cada control")
+    return (
+        "prompts dentro del programa; streaming del SDK de Claude servido en local (sin red ni "
+        "clave): control diario con su conclusión y coste (0,008 $), aviso de stop guardado "
+        "antes de llamar a Claude y, sin clave, informe con su etiqueta"
+    )
+
+
 def _check_levels() -> str:
     """H7: stop, objetivo y su propuesta, niveles en otra divisa y NO VERIFICABLE, y en una base
     de datos temporal, una tesis con su historial y un solo aviso de stop al día."""
@@ -792,6 +939,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Mandato y foto del NAV", _check_mandate),
         Check("Tesis y niveles", _check_levels),
         Check("Operaciones y efectivo", _check_trades),
+        Check("Claude e informe diario", _check_claude),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

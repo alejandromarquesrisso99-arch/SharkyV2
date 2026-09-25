@@ -913,6 +913,24 @@ class RunRepository(_Repository):
         )
         return [row_to(Run, fila) for fila in filas]
 
+    def list_for_step(self, step: str, limit: int = 50) -> list[Run]:
+        """Las últimas ejecuciones de un paso, de la más reciente a la más antigua."""
+        filas = self.conn.execute(
+            "SELECT * FROM runs WHERE step = ? ORDER BY started_at DESC, id DESC LIMIT ?",
+            (step, limit),
+        )
+        return [row_to(Run, fila) for fila in filas]
+
+    def spent_between(self, start: datetime, end: datetime) -> Decimal:
+        """Lo gastado en Claude entre `start` (incluido) y `end` (excluido). Las horas se
+        comparan como instantes, así da igual el desfase horario con el que se guardaron."""
+        total = ZERO
+        filas = self.conn.execute("SELECT started_at, cost_usd FROM runs WHERE cost_usd <> '0'")
+        for fila in filas:
+            if start <= datetime.fromisoformat(fila["started_at"]) < end:
+                total += Decimal(fila["cost_usd"])
+        return total
+
 
 # -- operaciones y efectivo (GUIA §5.5, H8) ---------------------------------------------------
 

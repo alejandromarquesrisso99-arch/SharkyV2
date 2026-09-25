@@ -7,6 +7,9 @@ La ventana también enseña los avisos de niveles (GUIA §5.6): la ventana modal
 encima de todo, y las notificaciones, que manda por la bandeja (`set_notifier`). Y cuando
 Operar registra algo (H8), vigila otra vez los niveles y pone al día el Panel y las Tesis; si una
 compra ha abierto una tesis, la enseña en Tesis para completarla.
+
+El control diario (H9) lo lanza el `ReportRunner` que comparten el Panel y los Informes; «Leer»
+lleva a Informes con ese informe abierto.
 """
 
 from __future__ import annotations
@@ -36,10 +39,11 @@ from sharky.core.levels import LevelCheck
 from sharky.core.mandate import STATE_LABELS, STATE_TOKENS
 from sharky.services.db import Database
 from sharky.services.market import FxProvider, PriceProvider, local_now
-from sharky.services.settings import Settings
+from sharky.services.settings import Settings, SettingsStore
 from sharky.ui.pages import SECTIONS, Section, SettingsPage, build_page, restyle
 from sharky.ui.panel import TOKEN_STYLE, PanelPage, day_text, short_when
 from sharky.ui.portfolio import PortfolioPage, PriceRefresher
+from sharky.ui.reports import ReportRunner, ReportsPage
 from sharky.ui.theme import Theme, ThemeController
 from sharky.ui.theses import LevelNotifier, StopAlertDialog, ThesesPage
 from sharky.ui.trade import TradePage
@@ -69,6 +73,8 @@ class MainWindow(QMainWindow):
         fx: FxProvider | None = None,
         settings: Settings | None = None,
         now: Callable[[], datetime] | None = None,
+        store: SettingsStore | None = None,
+        runner_options: dict | None = None,
     ) -> None:
         super().__init__(parent)
         self._theme = theme
@@ -76,7 +82,10 @@ class MainWindow(QMainWindow):
         self._db = db
         self._market = market
         self._fx = fx
-        self._settings = settings
+        # Un solo objeto de ajustes para todas las páginas: lo que se guarda en Ajustes vale en
+        # el Panel y en los informes desde ese momento.
+        self._settings = settings if settings is not None else Settings()
+        self._store = store
         self._now = now
         self._buttons: dict[str, QPushButton] = {}
         self._pages: dict[str, QWidget] = {}
@@ -86,7 +95,15 @@ class MainWindow(QMainWindow):
         self.refresher: PriceRefresher | None = None
         if db is not None and market is not None and fx is not None:
             self.refresher = PriceRefresher(
-                db, market, fx, settings=settings, now=now or local_now, parent=self
+                db, market, fx, settings=self._settings, now=now or local_now, parent=self
+            )
+        #: «Ejecutar ahora» del control diario, compartido por el Panel y los Informes.
+        #: `runner_options` (el cliente de Claude, la clave…) solo lo cambian los tests.
+        self.reports_runner: ReportRunner | None = None
+        if db is not None and self.refresher is not None:
+            self.reports_runner = ReportRunner(
+                db, self.refresher, self._settings, now=now or local_now, parent=self,
+                **(runner_options or {}),
             )
 
         self.setWindowIcon(QIcon(str(paths.icon_path())))
@@ -107,6 +124,8 @@ class MainWindow(QMainWindow):
         if isinstance(panel, PanelPage):
             panel.summaryChanged.connect(self._sync_sidebar)
             panel.navigateRequested.connect(self.navigate)
+            if panel.daily_card is not None:
+                panel.daily_card.readRequested.connect(self.open_report)
 
         # Los avisos de niveles: después de las páginas, para que el Panel ya esté al día
         # cuando salga la ventana de un stop.
@@ -125,6 +144,8 @@ class MainWindow(QMainWindow):
         if isinstance(operar, TradePage):
             operar.recorded.connect(self._on_levels_changed)
             operar.thesisOpened.connect(lambda ticker: self.navigate("tesis", ticker))
+        if self.reports_runner is not None:
+            self.reports_runner.finished.connect(self._on_report_done)
 
         self._sync_sidebar()
         self.show_section(SECTIONS[0].key)
@@ -246,6 +267,8 @@ class MainWindow(QMainWindow):
                 settings=self._settings,
                 now=self._now,
                 refresher=self.refresher,
+                runner=self.reports_runner,
+                store=self._store,
             )
             if isinstance(pagina, SettingsPage):
                 pagina.restartRequested.connect(self.restartRequested)
@@ -290,6 +313,21 @@ class MainWindow(QMainWindow):
         pagina = self._pages[key]
         if ticker and isinstance(pagina, PortfolioPage | ThesesPage):
             pagina.select_ticker(ticker)
+
+    def open_report(self, report_id: int) -> None:
+        """«Leer» en el Panel: Informes, con ese informe abierto."""
+        self.show_section("informes")
+        pagina = self._pages["informes"]
+        if isinstance(pagina, ReportsPage):
+            pagina.select_report(report_id)
+
+    def _on_report_done(self, outcome: object) -> None:
+        """El control diario ha terminado: los avisos de niveles que haya dejado (ya se
+        guardaron antes de llamar a Claude) se enseñan si no se habían enseñado."""
+        if self.levels is not None:
+            niveles = getattr(outcome, "levels", None)
+            if niveles is not None:
+                self.levels.notify_pending(niveles.checks)
 
     # -- avisos de niveles -----------------------------------------------------------------
 
@@ -348,6 +386,8 @@ class MainWindow(QMainWindow):
 
     def shutdown(self) -> None:
         """Al salir: que las páginas corten lo que tengan a medias en segundo plano."""
+        if self.reports_runner is not None:
+            self.reports_runner.shutdown()
         if self.refresher is not None:
             self.refresher.shutdown()
         for dialogo in list(self.stop_dialogs):

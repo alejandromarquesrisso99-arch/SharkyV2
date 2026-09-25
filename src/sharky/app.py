@@ -249,6 +249,7 @@ def _check_ui() -> str:
     from sharky.ui.pages import SECTIONS
     from sharky.ui.panel import PanelPage
     from sharky.ui.portfolio import PortfolioPage
+    from sharky.ui.reports import ReportsPage
     from sharky.ui.theme import Theme, ThemeController
     from sharky.ui.theses import StopAlertDialog, ThesesPage
     from sharky.ui.trade import CashDialog, TradePage
@@ -280,6 +281,12 @@ def _check_ui() -> str:
             operar = ventana.page("operar")
             if not isinstance(operar, TradePage):
                 raise CheckFailure("la sección Operar no se ha construido")
+            informes = ventana.page("informes")
+            if not isinstance(informes, ReportsPage) or panel.daily_card is None:
+                raise CheckFailure("Informes o la tarjeta del control diario no se han construido")
+            ajustes = ventana.page("ajustes")
+            if getattr(ajustes, "claude_card", None) is None:
+                raise CheckFailure("el apartado Claude de Ajustes no se ha construido")
             cartera.reload()
             panel.reload()
             tesis.reload()
@@ -291,6 +298,8 @@ def _check_ui() -> str:
             panel.grab()  # el gráfico del valor por participación (pyqtgraph)
             tesis.grab()
             operar.grab()
+            informes.grab()
+            ajustes.grab()
             aviso.grab()
             efectivo.grab()
             destroy_now(aviso)
@@ -302,7 +311,8 @@ def _check_ui() -> str:
             db.close_all()
     return (
         f"ventana creada, {len(SECTIONS)} secciones recorridas (Panel con su gráfico, Cartera, "
-        "Operar con su diálogo de efectivo, Tesis con su aviso de stop y Ajustes con Datos), "
+        "Operar con su diálogo de efectivo, Tesis con su aviso de stop, Informes con el control "
+        "diario y Ajustes con Claude y Datos), "
         "temas claro y oscuro; asistente recorrido con la plantilla CSV"
     )
 
@@ -444,7 +454,8 @@ def run_gui() -> int:
     remember_theme(tema, almacen, ajustes)
     mercado = YahooMarket()  # yfinance se carga la primera vez que se usa, no ahora
     ventana = MainWindow(
-        tema, __version__, db=db, market=mercado, fx=mercado, settings=ajustes, now=local_now
+        tema, __version__, db=db, market=mercado, fx=mercado, settings=ajustes, now=local_now,
+        store=almacen,
     )
     al_frente["mostrar"] = ventana.bring_to_front
     bandeja = create_tray(ventana, ventana.bring_to_front, app.quit)

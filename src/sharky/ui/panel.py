@@ -8,7 +8,8 @@
   niveles se calculan con cada valoración: siguen aquí mientras dure la condición, aunque la
   ventana de aviso y la notificación solo salgan una vez al día.
 - Gráfico del valor por participación (pyqtgraph).
-- Tarjetas de los informes y del radar: «Próximamente» hasta H9, H10 y H11.
+- Tarjeta «Control diario» (H9, ui/reports.py): conclusión, «Leer» y «Ejecutar ahora» con su
+  precio aproximado. Las del semanal, el mensual y el radar: «Próximamente» hasta H10 y H11.
 
 Todo lo que se enseña sale de core (valoración, foto del NAV y auditoría); aquí no se calcula
 ni un euro. El Panel no escribe en la base de datos: la foto del día y los incumplimientos se
@@ -85,6 +86,7 @@ from sharky.services.settings import Settings
 from sharky.ui import theme as theme_module
 from sharky.ui.pages import card, muted, restyle, set_state, state_label
 from sharky.ui.portfolio import PriceRefresher, RefreshOutcome, RefreshProgress
+from sharky.ui.reports import DailyCard, ReportRunner
 from sharky.ui.theme import ThemeController
 
 log = logging.getLogger(__name__)
@@ -451,6 +453,7 @@ class PanelPage(QWidget):
         refresher: PriceRefresher,
         *,
         settings: Settings | None = None,
+        runner: ReportRunner | None = None,
         now: Callable[[], datetime] = local_now,
         parent: QWidget | None = None,
     ) -> None:
@@ -458,6 +461,9 @@ class PanelPage(QWidget):
         self._db = db
         self._theme = theme
         self._refresher = refresher
+        self._runner = runner
+        #: La tarjeta «Control diario» (sin `runner`, «Próximamente»).
+        self.daily_card: DailyCard | None = None
         self._settings = settings or Settings()
         self._now = now
         self.data: PanelData | None = None
@@ -508,9 +514,15 @@ class PanelPage(QWidget):
         abajo.addLayout(izquierda, 3)
         derecha = QVBoxLayout()
         derecha.setSpacing(16)
+        if runner is not None:
+            self.daily_card = DailyCard(db, runner, now=now)
+            derecha.addWidget(self.daily_card)
+        else:
+            derecha.addWidget(coming_soon(
+                "Control diario", "El control del día con Claude: su conclusión, «Leer» y "
+                "«Ejecutar ahora» con su precio aproximado."
+            ))
         for titulo, texto in (
-            ("Control diario", "El control del día con Claude: su conclusión, «Leer» y «Ejecutar "
-             "ahora» con su precio aproximado. Llega en el hito H9."),
             ("Noticias semanales", "El escaneo de noticias de cada posición, con sus fuentes. "
              "Llega en el hito H10."),
             ("Estudio mensual", "El estudio del mes con un veredicto por posición. Llega en el "
@@ -630,6 +642,8 @@ class PanelPage(QWidget):
         ahora = self._now()
         valoracion = load_valuation(conn, ahora, self._refresher.market_at)
         self._show(valoracion, ahora)
+        if self.daily_card is not None:
+            self.daily_card.refresh()
 
     def _show(self, valuation: Valuation, now: datetime) -> None:
         datos = panel_data(

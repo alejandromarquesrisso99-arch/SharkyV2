@@ -267,10 +267,19 @@ _V2_FX_FETCHED_AT = """
 ALTER TABLE fx_rates ADD COLUMN fetched_at TEXT;
 """
 
+# H9: el coste real de cada llamada a Claude se guarda también en el Registro (GUIA §5.7). El
+# gasto del mes y la estimación de cada botón salen de aquí y no de `reports`: «Ejecutar ahora»
+# sustituye el informe, y su coste no puede desaparecer de la cuenta del mes.
+_V3_RUNS_COST = """
+ALTER TABLE runs ADD COLUMN cost_usd TEXT NOT NULL DEFAULT '0';
+CREATE INDEX runs_by_step ON runs (step, started_at);
+"""
+
 #: Todas las migraciones, en orden. Las nuevas se añaden al final y nunca se editan.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "Esquema inicial: las tablas de GUIA §5.1", _V1_SCHEMA),
     Migration(2, "Hora de descarga de los tipos de cambio", _V2_FX_FETCHED_AT),
+    Migration(3, "Coste de Claude en el Registro de ejecuciones", _V3_RUNS_COST),
 )
 
 #: Las tablas que tiene que tener cualquier base de datos de Sharky.

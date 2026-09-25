@@ -228,14 +228,26 @@ _STYLESHEET = Template(
     }
     QPushButton#link:hover { background-color: $surface_selected; }
 
-    QPushButton#thesisItem {
+    QPushButton#thesisItem, QPushButton#reportItem {
         background-color: $surface; border: 1px solid $border; border-radius: 8px;
         padding: 0px; text-align: left;
     }
-    QPushButton#thesisItem:hover { background-color: $surface_alt; }
-    QPushButton#thesisItem:checked {
+    QPushButton#thesisItem:hover, QPushButton#reportItem:hover { background-color: $surface_alt; }
+    QPushButton#thesisItem:checked, QPushButton#reportItem:checked {
         background-color: $surface_selected; border: 1px solid $accent;
     }
+    QPushButton#filterChip {
+        background-color: $surface; border: 1px solid $border; border-radius: 12px;
+        padding: 3px 14px; min-height: 18px; font-weight: 600;
+    }
+    QPushButton#filterChip:checked {
+        background-color: $surface_selected; border: 1px solid $accent;
+    }
+    QFrame#chipMuted {
+        background-color: $surface_alt; border: 1px solid $border; border-radius: 6px;
+    }
+    QFrame#chipMuted QLabel { color: $text_muted; font-weight: 600; }
+    QTextBrowser { background-color: $surface; color: $text; border: none; }
     QLabel#fieldLabel { color: $text_muted; font-weight: 600; }
     QLabel#alertTitle { color: $danger; font-size: 20px; font-weight: 700; }
     QPlainTextEdit {
