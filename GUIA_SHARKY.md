@@ -550,6 +550,11 @@ Aceptación, en el otro PC y solo con el instalador:
 
 _(Apunta aquí lo que se te ocurra. Nada de esta lista se construye hasta cerrar H13.)_
 
+- **Stop fijo o dinámico en cada tesis** (propuesto en el H7). En dinámico (trailing), el stop
+  que se vigila es el mayor entre el del usuario y el precio más alto visto con precio fiable
+  menos el riesgo inicial: sube con el precio real y nunca baja; el número del usuario no se
+  toca. Necesita una migración (modo y máximo visto en `theses`).
+
 ---
 
 ## Apéndice A · Plantilla CSV (datos ficticios)

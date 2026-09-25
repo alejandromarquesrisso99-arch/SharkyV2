@@ -5,8 +5,8 @@
 - Exposición por sector frente al tope del mandato, y el efectivo.
 - «Actualizar precios (gratis)» descarga en un hilo de trabajo, con barra de progreso y
   «Cancelar»: la ventana no se congela. La descarga (`PriceRefresher`) es la misma para el
-  Panel y la Cartera, y al terminar deja guardadas la foto del NAV del día y la auditoría del
-  mandato.
+  Panel, la Cartera y las Tesis, y al terminar deja guardadas la foto del NAV del día, la
+  auditoría del mandato y los avisos de niveles.
 - «Editar activo»: símbolo (con «Probar» y la sugerencia por ISIN), sector y clase.
 
 Todo lo que se enseña sale de `core.valuation`; aquí no se calcula ni un euro.
@@ -89,8 +89,10 @@ from sharky.services.market import (
 )
 from sharky.services.repositories import (
     AssetRepository,
+    RecordedLevels,
     RecordedValuation,
     ThesisRepository,
+    record_levels,
     record_valuation,
 )
 from sharky.services.settings import Settings
@@ -573,6 +575,7 @@ class RefreshOutcome:
     refresh: MarketRefresh
     valuation: Valuation
     recorded: RecordedValuation
+    levels: RecordedLevels
 
 
 def refresh_and_value(
@@ -584,14 +587,16 @@ def refresh_and_value(
     progress: Callable[[int, int], None] | None = None,
     cancel: threading.Event | None = None,
 ) -> RefreshOutcome:
-    """Descarga y guarda los precios, valora y deja la foto del NAV del día y la auditoría del
-    mandato. Corre en un hilo de trabajo."""
+    """Descarga y guarda los precios, valora y deja la foto del NAV del día, la auditoría del
+    mandato y los avisos de niveles de las tesis, en una transacción. Corre en un hilo de
+    trabajo."""
     refresco = refresh_market(db, prices, fx, now(), progress, cancel)
     momento = now()
     valoracion = load_valuation(db.connection(), momento, refresco.fetched_at)
     with db.transaction() as conn:
         registro = record_valuation(conn, valoracion, rules, momento)
-    return RefreshOutcome(refresco, valoracion, registro)
+        niveles = record_levels(conn, valoracion, momento)
+    return RefreshOutcome(refresco, valoracion, registro, niveles)
 
 
 class PriceRefresher(QObject):

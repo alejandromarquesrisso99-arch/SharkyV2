@@ -12,6 +12,23 @@ from sharky import paths
 
 log = logging.getLogger(__name__)
 
+#: Cuánto se queda a la vista una notificación (Windows puede decidir otra cosa).
+NOTIFICATION_MS = 15_000
+
+
+def tray_notifier(tray: QSystemTrayIcon) -> Callable[[str, str, bool], None]:
+    """Las notificaciones de Sharky por la bandeja: `(título, texto, crítica)`."""
+
+    def notificar(title: str, text: str, critical: bool) -> None:
+        icono = (
+            QSystemTrayIcon.MessageIcon.Critical
+            if critical
+            else QSystemTrayIcon.MessageIcon.Information
+        )
+        tray.showMessage(title, text, icono, NOTIFICATION_MS)
+
+    return notificar
+
 
 def create_tray(
     parent: QWidget,

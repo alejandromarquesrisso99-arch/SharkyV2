@@ -2,12 +2,15 @@
 
 Abajo del lateral, siempre visibles, el estado del mandato y la hora del último control; en el
 botón del Panel, cuántas cosas requieren atención. Todo sale del Panel (ui/panel.py).
+
+La ventana también enseña los avisos de niveles (GUIA §5.6): la ventana modal de un stop, por
+encima de todo, y las notificaciones, que manda por la bandeja (`set_notifier`).
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from sharky import paths
 from sharky.core.formatting import format_pct
+from sharky.core.levels import LevelCheck
 from sharky.core.mandate import STATE_LABELS, STATE_TOKENS
 from sharky.services.db import Database
 from sharky.services.market import FxProvider, PriceProvider, local_now
@@ -35,10 +39,14 @@ from sharky.ui.pages import SECTIONS, Section, SettingsPage, build_page, restyle
 from sharky.ui.panel import TOKEN_STYLE, PanelPage, day_text, short_when
 from sharky.ui.portfolio import PortfolioPage, PriceRefresher
 from sharky.ui.theme import Theme, ThemeController
+from sharky.ui.theses import LevelNotifier, StopAlertDialog, ThesesPage
 
 log = logging.getLogger(__name__)
 
 SIDEBAR_WIDTH = 236
+
+#: `notificador(título, texto, crítica)`: una notificación del sistema (la de la bandeja).
+Notifier = Callable[[str, str, bool], None]
 
 
 class MainWindow(QMainWindow):
@@ -96,6 +104,21 @@ class MainWindow(QMainWindow):
         if isinstance(panel, PanelPage):
             panel.summaryChanged.connect(self._sync_sidebar)
             panel.navigateRequested.connect(self.navigate)
+
+        # Los avisos de niveles: después de las páginas, para que el Panel ya esté al día
+        # cuando salga la ventana de un stop.
+        self._notifier: Notifier | None = None
+        #: Las ventanas de aviso de stop abiertas.
+        self.stop_dialogs: list[StopAlertDialog] = []
+        self.levels: LevelNotifier | None = None
+        if db is not None and self.refresher is not None:
+            self.levels = LevelNotifier(db, self.refresher, now or local_now, parent=self)
+            self.levels.stopAlert.connect(self.show_stop_alert)
+            self.levels.notification.connect(self._notify)
+        tesis = self._pages.get("tesis")
+        if isinstance(tesis, ThesesPage):
+            tesis.levelsChanged.connect(self._on_levels_changed)
+
         self._sync_sidebar()
         self.show_section(SECTIONS[0].key)
 
@@ -255,16 +278,73 @@ class MainWindow(QMainWindow):
         return self._pages[key]
 
     def navigate(self, key: str, ticker: str = "") -> None:
-        """«Ver» del Panel: la sección y, en Cartera, la fila de ese ticker."""
+        """«Ver» del Panel: la sección y, en Cartera o en Tesis, la de ese ticker."""
         self.show_section(key)
         pagina = self._pages[key]
-        if ticker and isinstance(pagina, PortfolioPage):
+        if ticker and isinstance(pagina, PortfolioPage | ThesesPage):
             pagina.select_ticker(ticker)
+
+    # -- avisos de niveles -----------------------------------------------------------------
+
+    def set_notifier(self, notifier: Notifier | None) -> None:
+        """Por dónde salen las notificaciones (la bandeja). Sin él, solo quedan en el registro."""
+        self._notifier = notifier
+
+    def _notify(self, title: str, text: str, critical: bool) -> None:
+        if self._notifier is None:
+            log.info("Notificación sin bandeja: %s", title)
+            return
+        try:
+            self._notifier(title, text, critical)
+        except Exception:  # una notificación que falla no puede tumbar la vigilancia
+            log.exception("No se ha podido enseñar la notificación «%s»", title)
+
+    def show_stop_alert(self, checks: Sequence[LevelCheck]) -> StopAlertDialog:
+        """La ventana de aviso de stop, modal y por encima de todo (aunque la ventana principal
+        esté escondida en la bandeja). Si ya hay una abierta, se le añaden."""
+        abiertas = [d for d in self.stop_dialogs if d.isVisible()]
+        if abiertas:
+            abiertas[-1].add_checks(checks)
+            abiertas[-1].raise_()
+            return abiertas[-1]
+        dialogo = StopAlertDialog(checks)
+        dialogo.openRequested.connect(self._open_from_alert)
+        dialogo.destroyed.connect(lambda *_a, d=dialogo: self._forget_dialog(d))
+        self.stop_dialogs.append(dialogo)
+        dialogo.show()
+        dialogo.raise_()
+        dialogo.activateWindow()
+        return dialogo
+
+    def _forget_dialog(self, dialog: StopAlertDialog) -> None:
+        if dialog in self.stop_dialogs:
+            self.stop_dialogs.remove(dialog)
+
+    def _open_from_alert(self) -> None:
+        self.bring_to_front()
+        self.show_section("panel")
+
+    def _on_levels_changed(self) -> None:
+        """Han cambiado los números de una tesis: se vigila otra vez con los precios guardados
+        y el Panel (y el lateral) se ponen al día."""
+        if self.levels is not None:
+            try:
+                self.levels.check_now()
+            except Exception:
+                log.exception("No se han podido vigilar los niveles tras cambiar una tesis")
+        tesis = self._pages.get("tesis")
+        if isinstance(tesis, ThesesPage):
+            tesis.reload()  # la vigilancia puede haber dejado una propuesta en el historial
+        panel = self._pages.get("panel")
+        if isinstance(panel, PanelPage) and not panel.refreshing:
+            panel.reload()
 
     def shutdown(self) -> None:
         """Al salir: que las páginas corten lo que tengan a medias en segundo plano."""
         if self.refresher is not None:
             self.refresher.shutdown()
+        for dialogo in list(self.stop_dialogs):
+            dialogo.close()
         for pagina in self._pages.values():
             parar = getattr(pagina, "shutdown", None)
             if callable(parar):

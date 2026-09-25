@@ -3,8 +3,10 @@
 - Estado del mandato con su drawdown y una barra con marcas en 3, 8 y 20 %.
 - Patrimonio (NAV) con su variación del día, coste, PnL y cobertura.
 - Efectivo frente a la banda del mandato.
-- «Requiere atención»: incumplimientos con su antigüedad, datos no fiables y posiciones sin
-  tesis. Los avisos de stop y objetivo llegan con H7.
+- «Requiere atención»: stops y objetivos alcanzados y niveles que no se pueden verificar (H7),
+  incumplimientos con su antigüedad, datos no fiables y posiciones sin tesis. Los avisos de
+  niveles se calculan con cada valoración: siguen aquí mientras dure la condición, aunque la
+  ventana de aviso y la notificación solo salgan una vez al día.
 - Gráfico del valor por participación (pyqtgraph).
 - Tarjetas de los informes y del radar: «Próximamente» hasta H9, H10 y H11.
 
@@ -44,6 +46,7 @@ from sharky.core.formatting import (
     format_pct,
     format_signed_amount,
 )
+from sharky.core.levels import LevelCheck, LevelStatus, alert_title, proposal_text
 from sharky.core.mandate import (
     ALERT_DRAWDOWN,
     CASH_ABOVE,
@@ -76,6 +79,7 @@ from sharky.services.repositories import (
     CashMovementRepository,
     NavSnapshotRepository,
     ThesisRepository,
+    load_level_checks,
 )
 from sharky.services.settings import Settings
 from sharky.ui import theme as theme_module
@@ -133,6 +137,7 @@ class PanelData:
     last_check: datetime | None
     rules: MandateRules
     today: date
+    levels: tuple[LevelCheck, ...] = ()
 
     @property
     def state(self) -> MandateState:
@@ -149,6 +154,32 @@ class PanelData:
         return next((f for f in self.findings if f.rule is rule and f.subject == subject), None)
 
 
+def level_items(levels: Sequence[LevelCheck]) -> list[AttentionItem]:
+    """Los avisos de niveles (GUIA §5.6): cada stop en rojo, cada objetivo en ámbar con su
+    propuesta, y las tesis que no se pueden verificar, juntas."""
+    items: list[AttentionItem] = []
+    for c in levels:
+        if c.status is LevelStatus.STOP:
+            items.append(AttentionItem(
+                "danger", alert_title(c),
+                "El mandato exige liquidar. Ejecuta en tu bróker y regístralo.", "tesis", c.ticker,
+            ))
+    for c in levels:
+        if c.status is LevelStatus.TARGET:
+            items.append(AttentionItem("warn", alert_title(c), proposal_text(c), "tesis", c.ticker))
+    sin_verificar = [c.ticker for c in levels if c.status is LevelStatus.UNVERIFIABLE]
+    if sin_verificar:
+        items.append(AttentionItem(
+            "warn",
+            f"Niveles sin verificar: {join_names(sin_verificar)}",
+            "Sin precio fiable no se sabe si han tocado su stop o su objetivo: actualiza los "
+            "precios.",
+            "tesis",
+            sin_verificar[0] if len(sin_verificar) == 1 else "",
+        ))
+    return items
+
+
 def attention_items(
     valuation: Valuation,
     findings: Sequence[Finding],
@@ -156,10 +187,12 @@ def attention_items(
     with_thesis: set[str],
     rules: MandateRules,
     today: date,
+    levels: Sequence[LevelCheck] = (),
 ) -> tuple[AttentionItem, ...]:
-    """«Requiere atención»: los incumplimientos (rojo si están escalados, o si la valoración no
-    es fiable) y las posiciones sin tesis. Lo rojo va primero."""
-    items: list[AttentionItem] = []
+    """«Requiere atención»: los avisos de niveles, los incumplimientos (rojo si están
+    escalados, o si la valoración no es fiable) y las posiciones sin tesis. Lo rojo va primero,
+    y dentro de lo rojo, los stops."""
+    items: list[AttentionItem] = level_items(levels)
     for h in findings:
         guardado = open_breaches.get(h.key)
         dias = days_open(guardado.opened_at, today) if guardado is not None else 0
@@ -206,6 +239,7 @@ def panel_data(
     con_tesis = {
         t.ticker for t in ThesisRepository(conn).list_all() if t.status is ThesisStatus.ACTIVE
     }
+    niveles = load_level_checks(conn, valuation)
     precios = [p.price.fetched_at for p in valuation.positions if p.price is not None]
     return PanelData(
         valuation=valuation,
@@ -213,11 +247,12 @@ def panel_data(
         held_since=held_since(foto, fotos),
         change=day_change(foto, fotos, movimientos),
         findings=hallazgos,
-        items=attention_items(valuation, hallazgos, abiertos, con_tesis, rules, hoy),
+        items=attention_items(valuation, hallazgos, abiertos, con_tesis, rules, hoy, niveles),
         series=unit_value_series(fotos, foto),
         last_check=market_at or max(precios, default=None),
         rules=rules,
         today=hoy,
+        levels=niveles,
     )
 
 

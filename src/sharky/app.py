@@ -248,6 +248,7 @@ def _check_ui() -> str:
     from sharky.ui.panel import PanelPage
     from sharky.ui.portfolio import PortfolioPage
     from sharky.ui.theme import Theme, ThemeController
+    from sharky.ui.theses import StopAlertDialog, ThesesPage
 
     def sin_red(_symbol: str) -> object:
         raise ConnectionError("autocomprobación: sin red a propósito")
@@ -270,19 +271,28 @@ def _check_ui() -> str:
             panel = ventana.page("panel")
             if not isinstance(panel, PanelPage) or panel.data is None:
                 raise CheckFailure("el Panel no se ha construido")
+            tesis = ventana.page("tesis")
+            if not isinstance(tesis, ThesesPage):
+                raise CheckFailure("la sección Tesis no se ha construido")
             cartera.reload()
             panel.reload()
+            tesis.reload()
+            aviso = StopAlertDialog([])  # la ventana del aviso de stop
             tema.set_theme(Theme.DARK)
             cartera.grab()
             panel.grab()  # el gráfico del valor por participación (pyqtgraph)
+            tesis.grab()
+            aviso.grab()
+            destroy_now(aviso)
             ventana.close()
             destroy_now(ventana)
             _walk_setup_wizard(db, Path(carpeta))
         finally:
             db.close_all()
     return (
-        f"ventana creada, {len(SECTIONS)} secciones recorridas (Panel con su gráfico, Cartera y "
-        "Ajustes con Datos), temas claro y oscuro; asistente recorrido con la plantilla CSV"
+        f"ventana creada, {len(SECTIONS)} secciones recorridas (Panel con su gráfico, Cartera, "
+        "Tesis con su aviso de stop y Ajustes con Datos), temas claro y oscuro; asistente "
+        "recorrido con la plantilla CSV"
     )
 
 
@@ -376,7 +386,7 @@ def run_gui() -> int:
     from sharky.services.settings import SettingsStore
     from sharky.ui.main_window import MainWindow
     from sharky.ui.theme import Theme, ThemeController
-    from sharky.ui.tray import create_tray
+    from sharky.ui.tray import create_tray, tray_notifier
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Sharky")
@@ -427,6 +437,10 @@ def run_gui() -> int:
     )
     al_frente["mostrar"] = ventana.bring_to_front
     bandeja = create_tray(ventana, ventana.bring_to_front, app.quit)
+    if bandeja is not None:
+        # Los avisos de stop y objetivo salen como notificaciones de Windows (GUIA §5.6).
+        ventana.set_notifier(tray_notifier(bandeja))
+        bandeja.messageClicked.connect(ventana.bring_to_front)
 
     reinicio = {"pedido": False}
 

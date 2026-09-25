@@ -2,8 +2,9 @@
 
 Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, la base de
 datos (esquema, migraciones, copia y restauración), los ajustes, la plantilla CSV del asistente,
-los precios y la valoración (con un Yahoo simulado), el mandato y la foto del NAV, el
-Administrador de credenciales, las bibliotecas de mercado e IA y los recursos del paquete. Todo
+los precios y la valoración (con un Yahoo simulado), el mandato y la foto del NAV, las tesis y
+la vigilancia de sus niveles, el Administrador de credenciales, las bibliotecas de mercado e IA
+y los recursos del paquete. Todo
 lo que escribe va a una carpeta temporal: nunca toca los datos del usuario ni su clave.
 Con `--online` añade una cotización real con su tipo de cambio y una conexión TLS con la API
 de Claude.
@@ -466,6 +467,114 @@ def _check_mandate() -> str:
     )
 
 
+def _check_levels() -> str:
+    """H7: stop, objetivo y su propuesta, niveles en otra divisa y NO VERIFICABLE, y en una base
+    de datos temporal, una tesis con su historial y un solo aviso de stop al día."""
+    from datetime import timedelta
+
+    from sharky.core.ledger import Position
+    from sharky.core.levels import LevelStatus, StopCriterion, check_thesis, propose_stop
+    from sharky.core.models import (
+        Asset,
+        CashKind,
+        CashMovement,
+        FxRate,
+        Price,
+        PriceSource,
+        Thesis,
+        Trade,
+        TradeKind,
+    )
+    from sharky.core.valuation import Valuation, value_portfolio
+    from sharky.services.db import Database
+    from sharky.services.market import load_valuation
+    from sharky.services.repositories import (
+        AssetRepository,
+        CashMovementRepository,
+        PriceRepository,
+        ThesisEventRepository,
+        TradeRepository,
+        create_theses,
+        record_levels,
+    )
+
+    ahora = datetime(2026, 1, 2, 18, 0, tzinfo=UTC)
+    hoy = ahora.date()
+    activo = Asset("ACME", "Acme", "EUR", yahoo_symbol="ACME")
+    posicion = Position("ACME", Decimal("10"), Decimal("1000"))
+
+    def valorar(precio: str, hace: timedelta = timedelta(0)) -> Valuation:
+        cierre = Price("ACME", hoy, Decimal(precio), "EUR", PriceSource.MARKET, ahora - hace)
+        return value_portfolio([posicion], {"ACME": activo}, Decimal("0"), {"ACME": cierre}, {},
+                               ahora, ahora)
+
+    def estado(tesis: Thesis, valoracion: Valuation, cambios: dict | None = None) -> LevelStatus:
+        [p] = valoracion.positions
+        return check_thesis(tesis, p, cambios or {}, ahora, ahora).status
+
+    niveles = Thesis("ACME", "EUR", hoy, stop=Decimal("100"), target=Decimal("90"))
+    casos = {
+        "stop tocado": (Thesis("ACME", "EUR", hoy, stop=Decimal("95")), valorar("95"),
+                        LevelStatus.STOP),
+        "objetivo": (Thesis("ACME", "EUR", hoy, target=Decimal("120")), valorar("121"),
+                     LevelStatus.TARGET),
+        "prioridad del stop": (niveles, valorar("95"), LevelStatus.STOP),
+        "precio antiguo": (niveles, valorar("50", timedelta(days=2)), LevelStatus.UNVERIFIABLE),
+    }
+    for nombre, (tesis, valoracion, esperado) in casos.items():
+        if estado(tesis, valoracion) is not esperado:
+            raise CheckFailure(f"vigilancia de niveles: «{nombre}» no da {esperado}")
+    en_usd = Thesis("ACME", "USD", hoy, stop=Decimal("110"))
+    dolar = {"USD": FxRate("USD", hoy, Decimal("0.95"), PriceSource.MARKET, ahora)}
+    if estado(en_usd, valorar("100"), dolar) is not LevelStatus.STOP:
+        raise CheckFailure("un stop en USD no se compara en EUR")
+    if estado(en_usd, valorar("100")) is not LevelStatus.UNVERIFIABLE:
+        raise CheckFailure("sin cambio del dólar, un stop en USD no puede darse por verificado")
+    propuesta = propose_stop(Decimal("121"), Decimal("100"), Decimal("90"), Decimal("10"))
+    if propuesta is None or (propuesta.stop, propuesta.criterion) != (
+        Decimal("111"), StopCriterion.TRAILING
+    ):
+        raise CheckFailure(f"el stop propuesto no mantiene el riesgo inicial: {propuesta}")
+    vigente = propose_stop(Decimal("121"), Decimal("100"), Decimal("115"), Decimal("10"))
+    if vigente is None or vigente.raises or vigente.stop != Decimal("115"):
+        raise CheckFailure("el stop propuesto baja del stop vigente")
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_levels_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+        try:
+            db.migrate()
+            with db.transaction() as conn:
+                AssetRepository(conn).add(activo)
+                TradeRepository(conn).add(Trade(hoy, "ACME", TradeKind.OPENING, Decimal("10"),
+                                                Decimal("100"), "EUR", Decimal("1"),
+                                                Decimal("0"), Decimal("1000")))
+                CashMovementRepository(conn).add(CashMovement(hoy, CashKind.INITIAL,
+                                                              Decimal("0")))
+                PriceRepository(conn).save(Price("ACME", hoy, Decimal("95"), "EUR",
+                                                 PriceSource.MARKET, ahora))
+                [id_tesis] = create_theses(conn, [Thesis("ACME", "EUR", hoy,
+                                                         stop=Decimal("100"))], ahora)
+            nuevos = []
+            for _ in range(2):
+                valoracion = load_valuation(db.connection(), ahora, ahora)
+                with db.transaction() as conn:
+                    nuevos.append(len(record_levels(conn, valoracion, ahora).new_alerts))
+            historial = ThesisEventRepository(db.connection()).list_for(id_tesis)
+        finally:
+            db.close_all()
+    if nuevos != [1, 0]:
+        raise CheckFailure(f"el aviso de stop no se guarda una vez al día: {nuevos}")
+    if len(historial) != 1:
+        raise CheckFailure("la tesis no guarda su evento de creación")
+    return (
+        "stop, objetivo y prioridad del stop; un stop en USD se compara en EUR; con precio "
+        "antiguo o sin cambio, NO VERIFICABLE; stop propuesto con el riesgo inicial y nunca por "
+        "debajo del vigente; un solo aviso de stop al día"
+    )
+
+
 def configure_keyring() -> str:
     """Fija el backend de Windows en código: dentro del exe no se descubre solo (GUIA §3)."""
     return secret_store.configure_backend()
@@ -579,6 +688,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Plantilla CSV y cartera inicial", _check_csv_template),
         Check("Precios y valoración", _check_market),
         Check("Mandato y foto del NAV", _check_mandate),
+        Check("Tesis y niveles", _check_levels),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

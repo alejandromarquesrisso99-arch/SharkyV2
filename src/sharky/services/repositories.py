@@ -9,18 +9,19 @@ transacción:
 
 Escribir fuera de una transacción es un error de programación y se rechaza.
 
-Aquí solo hay lo común (dar de alta, consultar y listar). Lo propio de cada pantalla (cerrar
-una tesis, resolver un incumplimiento…) llega con su hito.
+Aquí está lo común (dar de alta, consultar y listar) y lo propio de cada hito: la foto del NAV
+y la auditoría (H6), y las tesis y la vigilancia de sus niveles (H7).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import types
 import typing
-from collections.abc import Iterable
-from dataclasses import dataclass, fields
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, fields, replace
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -29,10 +30,27 @@ from typing import Any
 
 from sharky.core.csv_import import Opening
 from sharky.core.ledger import cash_balance
+from sharky.core.levels import (
+    LevelCheck,
+    ProposalState,
+    changes,
+    evaluate_levels,
+    from_json,
+    levels_of,
+    proposal_blocker,
+    proposal_levels,
+    proposal_states,
+    target_proposal_event,
+    texts_of,
+    to_decimal,
+    to_json,
+    validate_levels,
+)
 from sharky.core.mandate import Finding, MandateRules, audit, snapshot_for
 from sharky.core.models import (
     AlertStatus,
     Asset,
+    Author,
     Breach,
     CashMovement,
     FxRate,
@@ -45,11 +63,14 @@ from sharky.core.models import (
     Run,
     Thesis,
     ThesisEvent,
+    ThesisEventKind,
     ThesisStatus,
     Trade,
     WatchlistItem,
 )
-from sharky.core.valuation import Valuation
+from sharky.core.valuation import Valuation, normalize_currency
+
+log = logging.getLogger(__name__)
 
 
 class NotInTransactionError(RuntimeError):
@@ -307,6 +328,25 @@ class ThesisRepository(_Repository):
     def list_all(self) -> list[Thesis]:
         return self._select(order="opened_on, id")
 
+    def list_active(self) -> list[Thesis]:
+        return self._select("status = ?", (ThesisStatus.ACTIVE.value,), order="ticker")
+
+    def update(self, thesis: Thesis) -> bool:
+        """Sustituye los datos de la tesis con ese id. Devuelve si existía.
+
+        Solo la usan las operaciones de más abajo, que dejan cada cambio en el historial.
+        """
+        _require_transaction(self.conn)
+        if thesis.id is None:
+            raise ValueError("La tesis no tiene id: no está guardada")
+        columnas = _columns(Thesis, with_id=False)
+        asignaciones = ", ".join(f'"{c}" = ?' for c in columnas)
+        valores = [to_db(getattr(thesis, c)) for c in columnas]
+        cursor = self.conn.execute(
+            f"UPDATE theses SET {asignaciones} WHERE id = ?", [*valores, thesis.id]
+        )
+        return cursor.rowcount > 0
+
 
 class ThesisEventRepository(_Repository):
     """El historial solo crece: no hay forma de cambiar ni borrar un evento."""
@@ -315,6 +355,9 @@ class ThesisEventRepository(_Repository):
 
     def add(self, event: ThesisEvent) -> int:
         return _insert(self.conn, self.table, event)
+
+    def get(self, event_id: int) -> ThesisEvent | None:
+        return self._one("id = ?", (event_id,))
 
     def list_for(self, thesis_id: int) -> list[ThesisEvent]:
         return self._select("thesis_id = ?", (thesis_id,), order="id")
@@ -339,6 +382,16 @@ class LevelAlertRepository(_Repository):
 
     def list_for_date(self, day: date) -> list[LevelAlert]:
         return self._select("alert_date = ?", (to_db(day),), order="id")
+
+    def pending(self, day: date) -> list[LevelAlert]:
+        """Los avisos de ese día que todavía no se han enseñado."""
+        return self._select("alert_date = ? AND notified = 0", (to_db(day),), order="id")
+
+    def mark_notified(self, ids: Iterable[int]) -> None:
+        _require_transaction(self.conn)
+        self.conn.executemany(
+            "UPDATE level_alerts SET notified = 1 WHERE id = ?", [(i,) for i in ids]
+        )
 
 
 class BreachRepository(_Repository):
@@ -493,6 +546,285 @@ def record_valuation(
     hallazgos = audit(valuation, foto.state, rules)
     abiertos = BreachRepository(conn).sync((h.key for h in hallazgos), now)
     return RecordedValuation(foto, guardada, hallazgos, tuple(abiertos))
+
+
+# -- tesis (GUIA §5.6, H7) --------------------------------------------------------------------
+
+
+class ThesisError(ValueError):
+    """Los datos de una tesis no valen o la operación no se puede hacer. El mensaje (una línea
+    por error) se puede enseñar."""
+
+    def __init__(self, errors: Sequence[str]) -> None:
+        self.errors = list(errors)
+        super().__init__("\n".join(self.errors))
+
+
+QUICK_ADD_NOTE = "Tesis creada con el alta rápida"
+
+
+def _levels_currency(text: str) -> str:
+    divisa = normalize_currency(text or "")
+    if divisa is None:
+        raise ThesisError([f"«{text}» no es una divisa: tres letras, como EUR o USD."])
+    return divisa
+
+
+def create_theses(
+    conn: sqlite3.Connection,
+    theses: Sequence[Thesis],
+    now: datetime,
+    note: str = QUICK_ADD_NOTE,
+) -> list[int]:
+    """Da de alta tesis nuevas, cada una con su evento de creación (autor: el usuario). Va
+    dentro de la transacción de quien llama: o entran todas o ninguna.
+
+    Si alguna no vale, lanza ThesisError con todos los errores a la vez, con su ticker.
+    """
+    _require_transaction(conn)
+    activos = AssetRepository(conn)
+    repositorio = ThesisRepository(conn)
+    errores: list[str] = []
+    limpias: list[Thesis] = []
+    vistos: set[str] = set()
+    for tesis in theses:
+        propios = validate_levels(tesis.entry_price, tesis.stop, tesis.target, tesis.conviction)
+        divisa = normalize_currency(tesis.levels_currency or "")
+        if divisa is None:
+            propios.append(f"«{tesis.levels_currency}» no es una divisa.")
+        if activos.get(tesis.ticker) is None:
+            propios.append("no existe ese activo.")
+        elif repositorio.active_for(tesis.ticker) is not None or tesis.ticker in vistos:
+            propios.append("ya tiene una tesis activa.")
+        vistos.add(tesis.ticker)
+        errores.extend(f"{tesis.ticker}: {e}" for e in propios)
+        limpias.append(
+            replace(tesis, levels_currency=divisa or tesis.levels_currency,
+                    status=ThesisStatus.ACTIVE, closed_on=None, id=None)
+        )
+    if errores:
+        raise ThesisError(errores)
+    eventos = ThesisEventRepository(conn)
+    ids: list[int] = []
+    for tesis in limpias:
+        id_tesis = repositorio.add(tesis)
+        eventos.add(
+            ThesisEvent(id_tesis, now, ThesisEventKind.CREATED, Author.USER, note,
+                        new_value=to_json(levels_of(tesis)))
+        )
+        ids.append(id_tesis)
+    log.info("Tesis creadas: %s", ", ".join(t.ticker for t in limpias))
+    return ids
+
+
+@dataclass(frozen=True)
+class ThesisEdit:
+    """Lo que el usuario deja en el editor de una tesis."""
+
+    entry_price: Decimal | None
+    stop: Decimal | None
+    target: Decimal | None
+    conviction: int | None
+    levels_currency: str
+    why: str = ""
+    catalysts: str = ""
+    risks: str = ""
+    invalidation: str = ""
+
+
+def _active_thesis(conn: sqlite3.Connection, thesis_id: int) -> Thesis:
+    tesis = ThesisRepository(conn).get(thesis_id)
+    if tesis is None:
+        raise ThesisError(["No existe esa tesis."])
+    if tesis.status is not ThesisStatus.ACTIVE:
+        raise ThesisError(["La tesis está cerrada: ya no se edita."])
+    return tesis
+
+
+def update_thesis(
+    conn: sqlite3.Connection,
+    thesis_id: int,
+    edit: ThesisEdit,
+    now: datetime,
+    reason: str = "",
+) -> tuple[int, ...]:
+    """Guarda lo editado. Cada cambio queda en el historial con el valor anterior y el nuevo:
+    los números en un CAMBIO_NIVELES (con el motivo) y los textos en una REVISION, las dos del
+    usuario. Sin cambios no escribe nada. Devuelve los eventos añadidos.
+    """
+    _require_transaction(conn)
+    actual = _active_thesis(conn, thesis_id)
+    divisa = _levels_currency(edit.levels_currency)
+    nueva = replace(
+        actual,
+        entry_price=edit.entry_price,
+        stop=edit.stop,
+        target=edit.target,
+        conviction=edit.conviction,
+        levels_currency=divisa,
+        why=edit.why.strip(),
+        catalysts=edit.catalysts.strip(),
+        risks=edit.risks.strip(),
+        invalidation=edit.invalidation.strip(),
+    )
+    antes_n, despues_n = changes(levels_of(actual), levels_of(nueva))
+    antes_t, despues_t = changes(texts_of(actual), texts_of(nueva))
+    if not despues_n and not despues_t:
+        return ()
+    orden = "stop" in despues_n or "objetivo" in despues_n
+    errores = validate_levels(nueva.entry_price, nueva.stop, nueva.target, nueva.conviction,
+                              check_order=orden)
+    if errores:
+        raise ThesisError(errores)
+    ThesisRepository(conn).update(nueva)
+    eventos = ThesisEventRepository(conn)
+    ids: list[int] = []
+    if despues_n:
+        ids.append(eventos.add(ThesisEvent(
+            thesis_id, now, ThesisEventKind.LEVELS_CHANGED, Author.USER, reason.strip(),
+            old_value=to_json(antes_n), new_value=to_json(despues_n),
+        )))
+    if despues_t:
+        ids.append(eventos.add(ThesisEvent(
+            thesis_id, now, ThesisEventKind.REVIEW, Author.USER,
+            old_value=to_json(antes_t), new_value=to_json(despues_t),
+        )))
+    log.info("Tesis de %s editada (%s)", actual.ticker,
+             ", ".join([*despues_n, *despues_t]))
+    return tuple(ids)
+
+
+_STATE_TEXT = {
+    ProposalState.APPLIED: "Esa propuesta ya se aplicó.",
+    ProposalState.DISCARDED: "Esa propuesta ya se descartó.",
+    ProposalState.SUPERSEDED: "Hay una propuesta más reciente que sustituye a esta.",
+}
+
+
+def _pending_proposal(conn: sqlite3.Connection, event_id: int) -> tuple[ThesisEvent, Thesis]:
+    evento = ThesisEventRepository(conn).get(event_id)
+    if evento is None or evento.kind is not ThesisEventKind.PROPOSAL:
+        raise ThesisError(["No existe esa propuesta."])
+    tesis = _active_thesis(conn, evento.thesis_id)
+    estado = proposal_states(ThesisEventRepository(conn).list_for(tesis.id)).get(event_id)
+    if estado is not ProposalState.PENDING:
+        raise ThesisError([_STATE_TEXT.get(estado, "Esa propuesta ya no está pendiente.")])
+    return evento, tesis
+
+
+def apply_proposal(conn: sqlite3.Connection, event_id: int, now: datetime) -> Thesis:
+    """«Aplicar»: el usuario acepta una propuesta. Los números cambian con un CAMBIO_NIVELES
+    suyo que apunta a la propuesta; la propuesta no se toca."""
+    _require_transaction(conn)
+    evento, tesis = _pending_proposal(conn, event_id)
+    bloqueo = proposal_blocker(evento, tesis)
+    if bloqueo:
+        raise ThesisError([bloqueo])
+    propuestos = proposal_levels(evento)
+    conviccion = propuestos.get("conviccion", tesis.conviction)
+    nueva = replace(
+        tesis,
+        stop=to_decimal(propuestos["stop"]) if propuestos.get("stop") is not None else tesis.stop,
+        target=(
+            to_decimal(propuestos["objetivo"])
+            if propuestos.get("objetivo") is not None
+            else tesis.target
+        ),
+        conviction=int(conviccion) if conviccion is not None else None,
+    )
+    errores = validate_levels(nueva.entry_price, nueva.stop, nueva.target, nueva.conviction,
+                              check_order=False)
+    if errores:
+        raise ThesisError(errores)
+    antes, despues = changes(levels_of(tesis), levels_of(nueva))
+    ThesisRepository(conn).update(nueva)
+    ThesisEventRepository(conn).add(ThesisEvent(
+        tesis.id, now, ThesisEventKind.LEVELS_CHANGED, Author.USER, "",
+        old_value=to_json(antes), new_value=to_json(despues), ref_event_id=event_id,
+    ))
+    log.info("Propuesta %d aplicada a la tesis de %s", event_id, tesis.ticker)
+    return nueva
+
+
+def discard_proposal(conn: sqlite3.Connection, event_id: int, now: datetime) -> int:
+    """«Descartar»: el usuario no la quiere. Queda un evento suyo que apunta a la propuesta."""
+    _require_transaction(conn)
+    _evento, tesis = _pending_proposal(conn, event_id)
+    id_evento = ThesisEventRepository(conn).add(ThesisEvent(
+        tesis.id, now, ThesisEventKind.REVIEW, Author.USER, "", ref_event_id=event_id,
+    ))
+    log.info("Propuesta %d descartada en la tesis de %s", event_id, tesis.ticker)
+    return id_evento
+
+
+# -- vigilancia de niveles ---------------------------------------------------------------------
+
+
+def load_level_checks(conn: sqlite3.Connection, valuation: Valuation) -> tuple[LevelCheck, ...]:
+    """Vigila las tesis activas con esta valoración (GUIA §5.6). Solo lee."""
+    tesis = ThesisRepository(conn).list_active()
+    eventos = ThesisEventRepository(conn)
+    historiales = {t.id: eventos.list_for(t.id) for t in tesis if t.id is not None}
+    return evaluate_levels(tesis, valuation, FxRateRepository(conn).latest_all(), historiales)
+
+
+@dataclass(frozen=True)
+class RecordedLevels:
+    """Lo que ha dejado guardado la vigilancia de niveles."""
+
+    checks: tuple[LevelCheck, ...]
+    new_alerts: tuple[LevelAlert, ...]  # los avisos que no existían todavía hoy
+    proposals: tuple[int, ...]  # las propuestas de Sharky añadidas al historial
+
+
+def _repeats_last_proposal(events: Sequence[ThesisEvent], proposal: ThesisEvent) -> bool:
+    """La última propuesta de Sharky de esa tesis ya proponía lo mismo (aplicada, descartada o
+    pendiente): no se vuelve a proponer cada día."""
+    anteriores = [
+        e for e in events if e.kind is ThesisEventKind.PROPOSAL and e.author is Author.SYSTEM
+    ]
+    if not anteriores:
+        return False
+    antes, ahora = from_json(anteriores[-1].new_value), from_json(proposal.new_value)
+    return (
+        antes.get("divisa") == ahora.get("divisa")
+        and to_decimal(antes.get("stop")) == to_decimal(ahora.get("stop"))
+    )
+
+
+def record_levels(
+    conn: sqlite3.Connection, valuation: Valuation, now: datetime
+) -> RecordedLevels:
+    """Vigila los niveles y guarda los avisos del día en `level_alerts`: uno por ticker, tipo
+    y día (el que ya existía no se repite ni se vuelve a notificar). Un OBJETIVO nuevo añade al
+    historial de su tesis la propuesta de subir el stop, si lo sube. Va dentro de la
+    transacción de quien llama.
+    """
+    _require_transaction(conn)
+    comprobaciones = load_level_checks(conn, valuation)
+    avisos = LevelAlertRepository(conn)
+    eventos = ThesisEventRepository(conn)
+    nuevos: list[LevelAlert] = []
+    propuestas: list[int] = []
+    for c in comprobaciones:
+        aviso = c.alert(now.date())
+        if aviso is None:
+            continue
+        id_aviso = avisos.add(aviso)
+        if id_aviso is None:
+            continue  # ya avisado hoy
+        nuevos.append(replace(aviso, id=id_aviso))
+        if c.thesis.id is None:
+            continue
+        propuesta = target_proposal_event(c, c.thesis.id, now)
+        if propuesta is not None and not _repeats_last_proposal(
+            eventos.list_for(c.thesis.id), propuesta
+        ):
+            propuestas.append(eventos.add(propuesta))
+    if nuevos:
+        log.info("Avisos de niveles nuevos: %s",
+                 ", ".join(f"{a.ticker} {a.kind}" for a in nuevos))
+    return RecordedLevels(comprobaciones, tuple(nuevos), tuple(propuestas))
 
 
 class RunRepository(_Repository):

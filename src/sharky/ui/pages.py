@@ -1,9 +1,9 @@
 """Las siete secciones de la ventana (GUIA §5.10).
 
 Las que todavía no tienen su hito están vacías a propósito: cada una dice qué vivirá en ella y
-en qué hito llega. Ya funcionan Panel (H6, en ui/panel.py), Cartera (H5, en ui/portfolio.py) y
-Ajustes, con Apariencia (el tema), Datos (copia de seguridad y restauración, H3) y Acerca de
-(la versión).
+en qué hito llega. Ya funcionan Panel (H6, en ui/panel.py), Cartera (H5, en ui/portfolio.py),
+Tesis (H7, en ui/theses.py) y Ajustes, con Apariencia (el tema), Datos (copia de seguridad y
+restauración, H3) y Acerca de (la versión).
 """
 
 from __future__ import annotations
@@ -512,13 +512,14 @@ def build_page(
     now: Callable[[], datetime] | None = None,
     refresher: Any | None = None,
 ) -> QWidget:
-    """La página de una sección. Panel y Cartera necesitan la base de datos y el mercado, y
-    comparten `refresher` (un `PriceRefresher`): la misma descarga y la misma hora de mercado."""
+    """La página de una sección. Panel, Cartera y Tesis necesitan la base de datos y el
+    mercado, y comparten `refresher` (un `PriceRefresher`): la misma descarga y la misma hora de
+    mercado."""
     if section.key == "ajustes":
         return SettingsPage(section, theme, version, db=db)
     con_mercado = db is not None and market is not None and fx is not None
-    if section.key in ("panel", "cartera") and con_mercado:
-        # panel y portfolio usan las piezas de aquí: se importan al hacer falta.
+    if section.key in ("panel", "cartera", "tesis") and con_mercado:
+        # panel, portfolio y theses usan las piezas de aquí: se importan al hacer falta.
         from sharky.ui.portfolio import PortfolioPage, PriceRefresher
 
         extra = {"now": now} if now is not None else {}
@@ -526,8 +527,12 @@ def build_page(
             return PortfolioPage(
                 db, theme, market, fx, settings=settings, refresher=refresher, **extra
             )
+        actualizador = refresher or PriceRefresher(db, market, fx, settings=settings, **extra)
+        if section.key == "tesis":
+            from sharky.ui.theses import ThesesPage
+
+            return ThesesPage(db, theme, actualizador, **extra)
         from sharky.ui.panel import PanelPage
 
-        actualizador = refresher or PriceRefresher(db, market, fx, settings=settings, **extra)
         return PanelPage(db, theme, actualizador, settings=settings, **extra)
     return PlaceholderPage(section)

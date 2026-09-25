@@ -51,6 +51,7 @@ from sharky.services.repositories import (
     CashMovementRepository,
     FxRateRepository,
     PriceRepository,
+    ThesisRepository,
     TradeRepository,
 )
 
@@ -553,6 +554,12 @@ def refresh_market(
             base = fx_currency(divisa)
             if base is not None:
                 divisas.add(base)
+    # Y los de las divisas de los niveles de las tesis (GUIA §5.6): un stop en USD de una
+    # acción que cotiza en EUR se compara en EUR con el cambio del dólar.
+    for tesis in ThesisRepository(conn).list_active():
+        base = fx_currency(tesis.levels_currency)
+        if tesis.ticker in abiertas and base is not None:
+            divisas.add(base)
     cancelado = resultado.cancelled or (cancel is not None and cancel.is_set())
     cambios = FxResult()
     if divisas and not resultado.offline and not cancelado:
