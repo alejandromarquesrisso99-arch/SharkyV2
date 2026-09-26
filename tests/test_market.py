@@ -4,6 +4,7 @@
 import threading
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal as D
+from types import SimpleNamespace
 
 import pytest
 from yfinance.exceptions import YFRateLimitError
@@ -151,6 +152,31 @@ def test_un_simbolo_que_yahoo_no_conoce():
     assert resultado.failures["NOEXISTE.MC"].kind is FailureKind.NO_DATA
     assert "NOEXISTE.MC" in resultado.failures["NOEXISTE.MC"].message
     assert not resultado.offline
+
+
+class ErrorHttp(OSError):
+    """Como el `HTTPError` de curl_cffi (que hereda de OSError): lleva la respuesta."""
+
+    def __init__(self, codigo):
+        super().__init__(f"HTTP Error {codigo}: ")
+        self.response = SimpleNamespace(status_code=codigo)
+
+
+def test_un_404_de_yahoo_no_es_estar_sin_conexion():
+    """Yahoo contesta 404 a un símbolo que no existe. Aunque sea el primero de la lista, no se
+    abandona la descarga como si no hubiera red (H11: un símbolo mal escrito del explorador)."""
+    yahoo = FakeYahoo({"B.MC": serie(2.0)}, errors={"AAAA": [ErrorHttp(404)]})
+    resultado = yahoo.market().fetch_quotes(["AAAA", "B.MC"])
+    assert not resultado.offline
+    assert set(resultado.quotes) == {"B.MC"}
+    assert resultado.failures["AAAA"].kind is FailureKind.NO_DATA
+    assert resultado.failures["AAAA"].message == "Yahoo no tiene cotizaciones recientes de AAAA."
+
+
+def test_un_429_de_yahoo_es_un_limite_y_se_reintenta():
+    yahoo = FakeYahoo({"A.MC": serie(1.0)}, errors={"A.MC": [ErrorHttp(429)]})
+    resultado = yahoo.market().fetch_quotes(["A.MC"])
+    assert set(resultado.quotes) == {"A.MC"} and yahoo.sleeps == [2.0]
 
 
 def test_sin_divisa_no_hay_precio():

@@ -2,9 +2,9 @@
 
 Las que todavía no tienen su hito están vacías a propósito: cada una dice qué vivirá en ella y
 en qué hito llega. Ya funcionan Panel (H6, en ui/panel.py), Cartera (H5, en ui/portfolio.py),
-Operar (H8, en ui/trade.py), Tesis (H7, en ui/theses.py), Informes (H9 y H10, en ui/reports.py) y
-Ajustes, con Claude (H9, en ui/settings.py), Apariencia (el tema), Datos (copia de seguridad y
-restauración, H3) y Acerca de (la versión).
+Operar (H8, en ui/trade.py), Tesis (H7, en ui/theses.py), Radar (H11, en ui/radar.py), Informes
+(H9 y H10, en ui/reports.py) y Ajustes, con Claude (H9, en ui/settings.py), Apariencia (el
+tema), Datos (copia de seguridad y restauración, H3) y Acerca de (la versión).
 """
 
 from __future__ import annotations
@@ -522,10 +522,12 @@ def build_page(
     refresher: Any | None = None,
     runner: Any | None = None,
     store: SettingsStore | None = None,
+    radar_runner: Any | None = None,
 ) -> QWidget:
     """La página de una sección. Panel, Cartera, Operar y Tesis necesitan la base de datos y
     el mercado, y comparten `refresher` (un `PriceRefresher`): la misma descarga y la misma hora
-    de mercado. El Panel y los Informes comparten `runner` (un `ReportRunner`)."""
+    de mercado. El Panel, los Informes y el Radar comparten `runner` (un `ReportRunner`); el
+    Radar usa además `radar_runner` (un `RadarRunner`, el filtro gratis)."""
     if section.key == "ajustes":
         return SettingsPage(section, theme, version, db=db, settings=settings, store=store,
                             now=now)
@@ -533,6 +535,12 @@ def build_page(
         from sharky.ui.reports import ReportsPage
 
         return ReportsPage(db, theme, runner)
+    if section.key == "radar" and db is not None:
+        from sharky.ui.radar import RadarPage
+
+        extra = {"now": now} if now is not None else {}
+        return RadarPage(db, theme, settings=settings, runner=runner, radar_runner=radar_runner,
+                         prices=market, **extra)
     con_mercado = db is not None and market is not None and fx is not None
     if section.key in ("panel", "cartera", "operar", "tesis") and con_mercado:
         # panel, portfolio, trade y theses usan las piezas de aquí: se importan al hacer falta.

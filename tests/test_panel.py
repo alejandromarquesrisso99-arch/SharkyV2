@@ -345,7 +345,9 @@ def test_textos_de_fecha():
 # -- tema y tarjetas pendientes -------------------------------------------------------------
 
 
-def test_las_tarjetas_de_informes_y_radar_quedan_para_mas_adelante(qtbot, cartera, tema):
+def test_sin_lanzador_las_tarjetas_de_informes_quedan_para_mas_adelante(qtbot, cartera, tema):
+    """Sin `runner`, los tres informes dicen «Próximamente»; la tarjeta del radar (H11) ya
+    funciona: lee las alertas activas de la base de datos."""
     from PySide6.QtWidgets import QLabel
 
     pagina = hacer_panel(qtbot, cartera, tema)
@@ -353,7 +355,8 @@ def test_las_tarjetas_de_informes_y_radar_quedan_para_mas_adelante(qtbot, carter
     for titulo in ("Control diario", "Noticias semanales", "Estudio mensual",
                    "Oportunidades en radar"):
         assert titulo in textos
-    assert textos.count("Próximamente") == 4
+    assert textos.count("Próximamente") == 3
+    assert pagina.radar_card.count_label.text() == "0 activas"
 
 
 def test_se_pinta_en_los_dos_temas(qtbot, cartera, tema):

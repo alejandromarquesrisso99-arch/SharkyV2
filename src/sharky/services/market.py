@@ -15,6 +15,11 @@ sin ningún precio conseguido, se da la descarga por perdida y la app trabaja co
 **La divisa la manda el proveedor.** Si Yahoo dice que un activo cotiza en otra divisa, el
 precio se guarda en la de Yahoo, el activo se corrige y se avisa.
 
+**Histórico del radar (H11).** `fetch_history` pide el histórico diario (máximo, mínimo y cierre,
+sin ajustar por dividendos) de algo más de 13 meses por el mismo camino de lotes y reintentos, y
+`load_histories` lo guarda en `price_history` como caché: si Yahoo falla, vale lo guardado hace
+menos de 24 h (CACHE); si es más viejo, ANTIGUO, y el filtro lo da por no verificable.
+
 La caché de yfinance vive en la carpeta de datos (`cache\\`). Todo lo de aquí se ejecuta en un
 hilo de trabajo: nunca desde el hilo de la interfaz.
 """
@@ -27,7 +32,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
@@ -37,6 +42,7 @@ from typing import Any, Protocol
 from sharky import paths
 from sharky.core.ledger import build_ledger
 from sharky.core.models import Asset, AssetClass, FxRate, Price, PriceSource
+from sharky.core.radar import HISTORY_DAYS, DailyBar, PriceHistory
 from sharky.core.valuation import (
     BASE_CURRENCY,
     fx_currency,
@@ -47,6 +53,7 @@ from sharky.services.db import Database
 from sharky.services.repositories import (
     AssetRepository,
     FxRateRepository,
+    PriceHistoryRepository,
     PriceRepository,
     ThesisRepository,
     TradeRepository,
@@ -148,6 +155,33 @@ class FxResult:
 
 
 @dataclass(frozen=True)
+class HistoryQuote:
+    """El histórico diario de un símbolo, en la divisa en la que cotiza según el proveedor."""
+
+    symbol: str
+    currency: str
+    bars: tuple[DailyBar, ...]
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class HistoryResult:
+    """Lo que ha dado pedir el histórico de unos símbolos."""
+
+    histories: dict[str, HistoryQuote] = field(default_factory=dict)
+    failures: dict[str, FetchFailure] = field(default_factory=dict)
+    cancelled: bool = False
+
+    @property
+    def offline(self) -> bool:
+        return (
+            not self.histories
+            and bool(self.failures)
+            and all(f.kind is FailureKind.NETWORK for f in self.failures.values())
+        )
+
+
+@dataclass(frozen=True)
 class SymbolSuggestion:
     """Un símbolo de Yahoo que corresponde a un ISIN."""
 
@@ -176,6 +210,18 @@ class FxProvider(Protocol):
     def fetch_fx(
         self, currencies: Sequence[str], cancel: threading.Event | None = None
     ) -> FxResult: ...
+
+
+class HistoryProvider(Protocol):
+    """El histórico diario del radar (H11). YahooMarket lo cumple junto a los otros dos."""
+
+    def fetch_history(
+        self,
+        symbols: Sequence[str],
+        since: date,
+        progress: Progress | None = None,
+        cancel: threading.Event | None = None,
+    ) -> HistoryResult: ...
 
 
 # -- yfinance ---------------------------------------------------------------------------
@@ -208,6 +254,14 @@ def _significant(value: Any) -> Decimal:
     return numero.quantize(Decimal(1).scaleb(numero.adjusted() - SIGNIFICANT_DIGITS + 1))
 
 
+def _maybe_price(value: Any) -> Decimal | None:
+    """Un número del histórico, o None si falta o no vale (NaN, cero…)."""
+    try:
+        return _significant(value)
+    except _NoData:
+        return None
+
+
 def _as_date(value: Any) -> date:
     if isinstance(value, datetime):
         return value.date()
@@ -221,6 +275,12 @@ def _chunks(items: Sequence[str], size: int) -> Iterator[list[str]]:
         yield list(items[inicio : inicio + size])
 
 
+def _http_status(error: BaseException) -> int | None:
+    """El código HTTP de un error que trae la respuesta (el `HTTPError` de curl_cffi)."""
+    codigo = getattr(getattr(error, "response", None), "status_code", None)
+    return codigo if isinstance(codigo, int) else None
+
+
 def _classify(error: BaseException) -> FailureKind:
     from yfinance.exceptions import YFException, YFRateLimitError
 
@@ -228,6 +288,13 @@ def _classify(error: BaseException) -> FailureKind:
         return FailureKind.RATE_LIMIT
     if isinstance(error, _NoData | YFException):
         return FailureKind.NO_DATA
+    # Yahoo ha contestado: un 404 es un símbolo que no conoce, no estar sin red (el HTTPError de
+    # curl_cffi también es un OSError). Visto en el H11 con un símbolo inexistente.
+    codigo = _http_status(error)
+    if codigo is not None:
+        if codigo == 429:
+            return FailureKind.RATE_LIMIT
+        return FailureKind.NETWORK if codigo >= 500 else FailureKind.NO_DATA
     if isinstance(error, OSError | TimeoutError):  # curl_cffi: sus errores son OSError
         return FailureKind.NETWORK
     return FailureKind.NO_DATA
@@ -339,9 +406,22 @@ class YahooMarket:
         cancel: threading.Event | None = None,
     ) -> FetchResult:
         """El último cierre de cada símbolo, por lotes y con reintentos. Nunca lanza."""
+        citas, fallos, cancelado = self._fetch_many(symbols, self._fetch_one, progress, cancel)
+        return FetchResult(citas, fallos, cancelled=cancelado)
+
+    def _fetch_many[T](
+        self,
+        symbols: Sequence[str],
+        fetch_one: Callable[[str], T],
+        progress: Progress | None,
+        cancel: threading.Event | None,
+    ) -> tuple[dict[str, T], dict[str, FetchFailure], bool]:
+        """`fetch_one` de cada símbolo, por lotes de 10 y con los reintentos si Yahoo limita. Sin
+        red no se insiste: al primer fallo de conexión sin nada conseguido, se abandona. Devuelve
+        lo conseguido, los fallos y si se ha cancelado. Nunca lanza."""
         simbolos = list(dict.fromkeys(s.strip() for s in symbols if s and s.strip()))
         total = len(simbolos)
-        citas: dict[str, Quote] = {}
+        citas: dict[str, T] = {}
         fallos: dict[str, FetchFailure] = {}
         hechos = 0
 
@@ -373,22 +453,22 @@ class YahooMarket:
                 for simbolo in por_intentar:
                     if cancelado():
                         abandonar(simbolos, FailureKind.CANCELLED)
-                        return FetchResult(citas, fallos, cancelled=True)
+                        return citas, fallos, True
                     try:
-                        citas[simbolo] = self._fetch_one(simbolo)
+                        citas[simbolo] = fetch_one(simbolo)
                     except Exception as error:
                         tipo = _classify(error)
                         if tipo is FailureKind.RATE_LIMIT:
                             limitados.append(simbolo)
                             continue
-                        log.info("Sin precio de %s: %s: %s", simbolo, type(error).__name__,
+                        log.info("Sin datos de %s: %s: %s", simbolo, type(error).__name__,
                                  error)
                         fallos[simbolo] = FetchFailure(simbolo, tipo, _describe(tipo, simbolo,
                                                                                 error))
                         if tipo is FailureKind.NETWORK and not citas:
-                            log.warning("Sin conexión con Yahoo: se usan los precios guardados")
+                            log.warning("Sin conexión con Yahoo: se usa lo guardado")
                             abandonar(simbolos, FailureKind.NETWORK)
-                            return FetchResult(citas, fallos)
+                            return citas, fallos, False
                     avanzar()
                 por_intentar = limitados
                 if not por_intentar:
@@ -398,7 +478,58 @@ class YahooMarket:
                     simbolo, FailureKind.RATE_LIMIT, _describe(FailureKind.RATE_LIMIT, simbolo)
                 )
                 avanzar()
-        return FetchResult(citas, fallos)
+        return citas, fallos, False
+
+    # -- histórico diario (radar, H11) -----------------------------------------------
+
+    def _fetch_history_one(self, symbol: str, since: date) -> HistoryQuote:
+        fabrica, _ = self._factories()
+        ticker = fabrica(symbol)
+        datos = ticker.history(
+            start=since.isoformat(),
+            interval="1d",
+            auto_adjust=False,
+            actions=False,
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        if datos is None or getattr(datos, "empty", True) or "Close" not in datos:
+            raise _NoData("sin histórico diario")
+        metadatos = ticker.history_metadata or {}
+        divisa = normalize_currency(str(metadatos.get("currency") or ""))
+        if divisa is None:
+            raise _NoData("no dice en qué divisa cotiza")
+        cierres = datos["Close"]
+        maximos = datos["High"] if "High" in datos else cierres
+        minimos = datos["Low"] if "Low" in datos else cierres
+        por_dia: dict[date, DailyBar] = {}
+        for momento, alto, bajo, cierre in zip(datos.index, maximos, minimos, cierres,
+                                               strict=True):
+            valor = _maybe_price(cierre)
+            if valor is None:
+                continue
+            maximo = _maybe_price(alto) or valor
+            minimo = _maybe_price(bajo) or valor
+            dia = _as_date(momento)
+            por_dia[dia] = DailyBar(dia, max(maximo, valor), min(minimo, valor), valor)
+        if not por_dia:
+            raise _NoData("sin cierres válidos en el histórico")
+        nombre = metadatos.get("longName") or metadatos.get("shortName") or None
+        return HistoryQuote(symbol, divisa, tuple(por_dia[d] for d in sorted(por_dia)),
+                            str(nombre) if nombre else None)
+
+    def fetch_history(
+        self,
+        symbols: Sequence[str],
+        since: date,
+        progress: Progress | None = None,
+        cancel: threading.Event | None = None,
+    ) -> HistoryResult:
+        """El histórico diario (máximo, mínimo y cierre) de cada símbolo desde `since`, por
+        lotes y con reintentos. Precios sin ajustar por dividendos. Nunca lanza."""
+        series, fallos, cancelado = self._fetch_many(
+            symbols, lambda s: self._fetch_history_one(s, since), progress, cancel
+        )
+        return HistoryResult(series, fallos, cancelled=cancelado)
 
     # -- tipos de cambio -------------------------------------------------------------
 
@@ -616,6 +747,66 @@ def refresh_market(
         " (cancelado)" if refresco.cancelled else "",
     )
     return refresco
+
+
+# -- el histórico del radar ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HistoryLoad:
+    """El histórico de unos símbolos: lo descargado ahora (MERCADO) o, si Yahoo ha fallado, lo
+    guardado (CACHE o ANTIGUO). `failures` dice por qué no se ha descargado cada uno."""
+
+    histories: dict[str, PriceHistory] = field(default_factory=dict)
+    failures: dict[str, str] = field(default_factory=dict)
+    downloaded: tuple[str, ...] = ()
+    offline: bool = False
+    cancelled: bool = False
+
+
+def load_histories(
+    db: Database,
+    provider: HistoryProvider,
+    symbols: Sequence[str],
+    now: datetime,
+    progress: Progress | None = None,
+    cancel: threading.Event | None = None,
+) -> HistoryLoad:
+    """Descarga el histórico diario de 13 meses de cada símbolo y lo guarda como caché en una
+    transacción. Lo que no se descarga se toma de la caché. Se ejecuta en un hilo de trabajo."""
+    simbolos = sorted({s.strip() for s in symbols if s and s.strip()})
+    if not simbolos:
+        return HistoryLoad()
+    ahora = now.replace(microsecond=0)
+    desde = ahora.date() - timedelta(days=HISTORY_DAYS)
+    resultado = provider.fetch_history(simbolos, desde, progress, cancel)
+    if resultado.histories:
+        with db.transaction() as tx:
+            cache = PriceHistoryRepository(tx)
+            for simbolo, serie in resultado.histories.items():
+                cache.replace(simbolo, serie.currency, serie.bars, ahora)
+    cache = PriceHistoryRepository(db.connection())
+    historias: dict[str, PriceHistory] = {}
+    fallos: dict[str, str] = {}
+    for simbolo in simbolos:
+        serie = resultado.histories.get(simbolo)
+        if serie is not None:
+            historias[simbolo] = PriceHistory(simbolo, serie.currency, serie.bars, ahora,
+                                              PriceSource.MARKET)
+            continue
+        guardada = cache.load(simbolo, ahora)
+        if guardada is not None:
+            historias[simbolo] = guardada
+        fallo = resultado.failures.get(simbolo)
+        fallos[simbolo] = fallo.message if fallo else f"Yahoo no ha dado el histórico de {simbolo}."
+    log.info(
+        "Histórico del radar: %d de %d símbolos descargados%s%s",
+        len(resultado.histories), len(simbolos),
+        " (sin conexión)" if resultado.offline else "",
+        " (cancelado)" if resultado.cancelled else "",
+    )
+    return HistoryLoad(historias, fallos, tuple(sorted(resultado.histories)),
+                       resultado.offline, resultado.cancelled)
 
 
 # -- editar un activo y probar un símbolo ------------------------------------------------

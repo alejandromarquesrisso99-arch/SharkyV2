@@ -275,11 +275,34 @@ ALTER TABLE runs ADD COLUMN cost_usd TEXT NOT NULL DEFAULT '0';
 CREATE INDEX runs_by_step ON runs (step, started_at);
 """
 
+# H11: el filtro del radar necesita el histórico diario de 12 meses (máximo, mínimo y cierre:
+# el ATR no sale solo de los cierres de `prices`), guardado por símbolo de Yahoo como caché. Y
+# cada fila del radar guarda la idea del candidato (nombre, símbolo, sector e invalidación) para
+# poder añadirlo a vigilancia o comprarlo días después.
+_V4_RADAR = """
+CREATE TABLE price_history (
+    symbol     TEXT NOT NULL,
+    bar_date   TEXT NOT NULL,
+    high       TEXT NOT NULL,
+    low        TEXT NOT NULL,
+    close      TEXT NOT NULL,
+    currency   TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, bar_date)
+) STRICT;
+ALTER TABLE alerts ADD COLUMN name TEXT;
+ALTER TABLE alerts ADD COLUMN yahoo_symbol TEXT;
+ALTER TABLE alerts ADD COLUMN sector TEXT;
+ALTER TABLE alerts ADD COLUMN invalidation TEXT NOT NULL DEFAULT '';
+CREATE INDEX alerts_by_ticker ON alerts (ticker, created_on);
+"""
+
 #: Todas las migraciones, en orden. Las nuevas se añaden al final y nunca se editan.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "Esquema inicial: las tablas de GUIA §5.1", _V1_SCHEMA),
     Migration(2, "Hora de descarga de los tipos de cambio", _V2_FX_FETCHED_AT),
     Migration(3, "Coste de Claude en el Registro de ejecuciones", _V3_RUNS_COST),
+    Migration(4, "Histórico diario del radar y la idea de cada candidato", _V4_RADAR),
 )
 
 #: Las tablas que tiene que tener cualquier base de datos de Sharky.
@@ -298,6 +321,7 @@ TABLES: tuple[str, ...] = (
     "reports",
     "alerts",
     "runs",
+    "price_history",
 )
 
 

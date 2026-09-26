@@ -250,6 +250,7 @@ def _check_ui() -> str:
     from sharky.ui.pages import SECTIONS
     from sharky.ui.panel import PanelPage
     from sharky.ui.portfolio import PortfolioPage
+    from sharky.ui.radar import AddWatchDialog, RadarPage
     from sharky.ui.reports import MonthlyRunDialog, ReportsPage
     from sharky.ui.theme import Theme, ThemeController
     from sharky.ui.theses import StopAlertDialog, ThesesPage
@@ -289,10 +290,15 @@ def _check_ui() -> str:
             ajustes = ventana.page("ajustes")
             if getattr(ajustes, "claude_card", None) is None:
                 raise CheckFailure("el apartado Claude de Ajustes no se ha construido")
+            radar = ventana.page("radar")
+            if not isinstance(radar, RadarPage) or ventana.radar_runner is None:
+                raise CheckFailure("la sección Radar o su filtro no se han construido")
             cartera.reload()
             panel.reload()
             tesis.reload()
             operar.reload()
+            radar.reload()
+            vigilar = AddWatchDialog(db, mercado, local_now)  # «Añadir valor…»
             aviso = StopAlertDialog([])  # la ventana del aviso de stop
             efectivo = CashDialog(db, local_now, None, Decimal(0))  # «Ajustar saldo»
             runner = ventana.reports_runner
@@ -306,12 +312,15 @@ def _check_ui() -> str:
             operar.grab()
             informes.grab()
             ajustes.grab()
+            radar.grab()
             aviso.grab()
             efectivo.grab()
             mes.grab()
+            vigilar.grab()
             destroy_now(aviso)
             destroy_now(efectivo)
             destroy_now(mes)
+            destroy_now(vigilar)
             ventana.close()
             destroy_now(ventana)
             _walk_setup_wizard(db, Path(carpeta))
@@ -319,9 +328,10 @@ def _check_ui() -> str:
             db.close_all()
     return (
         f"ventana creada, {len(SECTIONS)} secciones recorridas (Panel con su gráfico, Cartera, "
-        "Operar con su diálogo de efectivo, Tesis con su aviso de stop, Informes con las "
-        "tarjetas de los tres informes y el diálogo del mensual, y Ajustes con Claude y Datos), "
-        "temas claro y oscuro; asistente recorrido con la plantilla CSV"
+        "Operar con su diálogo de efectivo, Tesis con su aviso de stop, Radar con su filtro y "
+        "el diálogo de «Añadir valor», Informes con las tarjetas de los tres informes y el "
+        "diálogo del mensual, y Ajustes con Claude y Datos), temas claro y oscuro; asistente "
+        "recorrido con la plantilla CSV"
     )
 
 

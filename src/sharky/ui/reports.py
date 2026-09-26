@@ -11,8 +11,9 @@ del Panel y el lanzador que comparten.
   terminar se enseña el coste real.
 - **ReportRunner**: primero actualiza los precios con la descarga de siempre (gratis; el aviso
   de un stop sale en ese momento) y después, en un hilo de trabajo, el informe con Claude
-  (services/reports.py). Uno a la vez. No hay «Cancelar» mientras escribe Claude: al cerrar la
-  app se corta y no se guarda nada.
+  (services/reports.py) o la búsqueda de oportunidades del Radar (services/explorer.py, H11).
+  Uno a la vez. No hay «Cancelar» mientras escribe Claude: al cerrar la app se corta y no se
+  guarda nada.
 """
 
 from __future__ import annotations
@@ -57,7 +58,8 @@ from sharky.core.schedule import Month, parse_day, weekly_rule_text, weekly_wind
 from sharky.services import secrets
 from sharky.services.ai import ClaudeClient
 from sharky.services.db import Database
-from sharky.services.market import load_valuation, local_now
+from sharky.services.explorer import ExplorationOutcome, create_exploration
+from sharky.services.market import HistoryProvider, load_valuation, local_now
 from sharky.services.reports import (
     TRIGGER_MANUAL,
     ReportOutcome,
@@ -96,6 +98,7 @@ ACTION_KINDS: dict[AIAction, ReportKind] = {
     AIAction.DAILY: ReportKind.DAILY,
     AIAction.WEEKLY: ReportKind.WEEKLY,
     AIAction.MONTHLY: ReportKind.MONTHLY,
+    AIAction.EXPLORER: ReportKind.EXPLORATION,
 }
 
 #: Los filtros de la lista: texto y tipo (None = todos).
@@ -267,10 +270,17 @@ def run_report_job(
     client_factory: Callable[[str], ClaudeClient],
     cancel: threading.Event,
     progress: Callable[[int, int], None] | None = None,
-) -> ReportOutcome:
-    """Un informe en un hilo de trabajo, con los precios que acaban de guardarse."""
+    history: HistoryProvider | None = None,
+) -> ReportOutcome | ExplorationOutcome:
+    """Un informe (o una exploración) en un hilo de trabajo, con los precios que acaban de
+    guardarse."""
     valoracion = load_valuation(db.connection(), now(), market_at)
     comun = {"trigger": TRIGGER_MANUAL, "cancel": cancel, "client_factory": client_factory}
+    if action is AIAction.EXPLORER:
+        if history is None:
+            raise ValueError("El explorador necesita el histórico de precios")
+        return create_exploration(db, valoracion, settings, now, key_loader(), history,
+                                  on_stage=progress, market_at=market_at, **comun)
     if action is AIAction.WEEKLY:
         return create_weekly_report(db, valoracion, settings, now, key_loader(), **comun)
     if action is AIAction.MONTHLY:
@@ -300,8 +310,17 @@ STAGE_TEXTS: dict[AIAction, str] = {
     AIAction.DAILY: "Claude está escribiendo el control diario…",
     AIAction.WEEKLY: "Claude está buscando noticias en la web…",
     AIAction.MONTHLY: "Claude está escribiendo el estudio (paso 1 de 2)…",
+    AIAction.EXPLORER: "Claude está buscando ideas nuevas en la web (paso 1 de 3)…",
 }
 EXTRACTION_STAGE = "Claude está extrayendo los veredictos (paso 2 de 2)…"
+#: Los pasos siguientes al primero, por acción.
+LATER_STAGES: dict[AIAction, dict[int, str]] = {
+    AIAction.MONTHLY: {2: EXTRACTION_STAGE},
+    AIAction.EXPLORER: {
+        2: "Claude está extrayendo los candidatos (paso 2 de 3)…",
+        3: "Pasando el filtro con precios reales (paso 3 de 3, gratis)…",
+    },
+}
 
 
 class ReportRunner(QObject):
@@ -377,6 +396,8 @@ class ReportRunner(QObject):
             existente = monthly_for(conn, estudio)
         elif action is AIAction.WEEKLY:
             existente = weekly_for(conn, ahora.date())
+        elif action is AIAction.EXPLORER:
+            existente = None  # cada exploración es un informe nuevo
         else:
             existente = daily_for(conn, ahora.date())
         return RunPlan(
@@ -439,8 +460,9 @@ class ReportRunner(QObject):
             self._key_loader,
             self._client_factory,
             self._cancel or threading.Event(),
+            history=self._refresher.prices if accion is AIAction.EXPLORER else None,
         )
-        if accion is AIAction.MONTHLY:
+        if accion in LATER_STAGES:
             trabajo.pass_progress()
             trabajo.signals.progress.connect(self._on_progress)
         trabajo.signals.finished.connect(self._on_done)
@@ -449,8 +471,9 @@ class ReportRunner(QObject):
         start(trabajo)
 
     def _on_progress(self, step: int, _steps: int) -> None:
-        if step >= 2:
-            self.stageChanged.emit(EXTRACTION_STAGE)
+        texto = LATER_STAGES.get(self.action or AIAction.DAILY, {}).get(step)
+        if texto is not None:
+            self.stageChanged.emit(texto)
 
     def _on_done(self, outcome: ReportOutcome) -> None:
         self._worker = None
@@ -714,16 +737,23 @@ _WHAT: dict[AIAction, str] = {
     AIAction.MONTHLY: "escribe el estudio del mes y después se extrae un veredicto por "
                       "posición. Las revisiones y propuestas van a Tesis: no cambia ningún "
                       "número.",
+    AIAction.EXPLORER: "busca en la web ideas nuevas que no tengas ni vigiles y se extraen "
+                       "como mucho 8 candidatos, sin ningún precio. Al final, cada candidato "
+                       "pasa por el filtro del radar con precios reales (gratis): los niveles "
+                       "salen de ahí, nunca de Claude.",
 }
 _QUESTIONS: dict[AIAction, str] = {
     AIAction.DAILY: "¿Hacer ahora el control diario con Claude?",
     AIAction.WEEKLY: "¿Hacer ahora el semanal de noticias con Claude?",
     AIAction.MONTHLY: "¿Hacer ahora el estudio mensual con Claude?",
+    AIAction.EXPLORER: "¿Buscar ahora oportunidades nuevas con Claude?",
 }
 _NO_AI_QUESTIONS: dict[AIAction, str] = {
     AIAction.DAILY: "El control diario saldrá sin análisis de IA.",
     AIAction.WEEKLY: "El semanal saldrá sin análisis de IA.",
     AIAction.MONTHLY: "El estudio mensual saldrá sin análisis de IA.",
+    AIAction.EXPLORER: "La búsqueda de oportunidades necesita a Claude y ahora no se puede "
+                       "lanzar.",
 }
 _EXISTING: dict[AIAction, str] = {
     AIAction.DAILY: "Ya hay un control de hoy",

@@ -929,6 +929,154 @@ def _check_weekly_monthly() -> str:
     )
 
 
+def _check_radar() -> str:
+    """H11: el histórico de un yfinance simulado (con pandas, como el de verdad) llega con
+    máximos y mínimos; el filtro dispara con una acción normal que ha caído un 23 % y descarta
+    otra por su ratio; el candidato del explorador no tiene dónde guardar un precio; y el
+    explorador, con el SDK de Claude servido en local (sin red ni clave), deja su informe y una
+    alerta con los niveles del filtro, no con los que menciona Claude."""
+    import json
+    from datetime import timedelta
+
+    import anthropic
+    import httpx2
+    import pandas
+
+    from sharky.core.models import AlertStatus, CashKind, CashMovement, MandateState, PriceSource
+    from sharky.core.radar import FilterFailure, PriceHistory, apply_filter
+    from sharky.services.ai import ClaudeClient
+    from sharky.services.db import Database
+    from sharky.services.explorer import ExplorerCandidate, create_exploration
+    from sharky.services.market import YahooMarket, load_valuation
+    from sharky.services.reports import render_prompt
+    from sharky.services.repositories import CashMovementRepository, RadarAlertRepository
+    from sharky.services.settings import Settings
+
+    render_prompt("explorador", dict.fromkeys(
+        ("cartera", "vigilancia", "alertas", "mandato", "sectores_saturados"), "-"))
+    render_prompt("explorador_extraccion", {"exploracion": "-"})
+    campos = set(ExplorerCandidate.model_fields)
+    if any(p in c for c in campos for p in ("price", "stop", "target", "entry")):
+        raise CheckFailure(f"el candidato del explorador tiene dónde guardar un precio: {campos}")
+
+    hoy = date(2026, 1, 30)
+    ahora = datetime(2026, 1, 30, 18, 0, tzinfo=UTC)
+    dias: list[date] = []
+    dia = hoy
+    while len(dias) < 300:
+        if dia.weekday() < 5:
+            dias.append(dia)
+        dia -= timedelta(days=1)
+    dias.reverse()
+
+    def serie(final: float) -> pandas.DataFrame:
+        """Sube de 80 a 100 y cae hasta `final`, con un rango diario de ±1."""
+        cierres = [80 + 20 * i / 150 if i <= 150 else 100 + (final - 100) * (i - 150) / 149
+                   for i in range(300)]
+        cierres = [round(c, 2) for c in cierres]
+        indice = pandas.DatetimeIndex([pandas.Timestamp(d) for d in dias])
+        return pandas.DataFrame({"High": [c + 1 for c in cierres],
+                                 "Low": [c - 1 for c in cierres], "Close": cierres},
+                                index=indice.tz_localize("America/New_York"))
+
+    finales = {"CCJ": 78.0, "NVO": 88.0}
+
+    class TickerSimulado:
+        def __init__(self, symbol: str) -> None:
+            self.symbol = symbol
+            self.history_metadata: dict[str, str] = {}
+
+        def history(self, **_kwargs: object) -> pandas.DataFrame:
+            if self.symbol not in finales:
+                return pandas.DataFrame()
+            self.history_metadata = {"currency": "USD", "longName": self.symbol}
+            return serie(finales[self.symbol])
+
+    mercado = YahooMarket(ticker_factory=TickerSimulado,
+                          search_factory=lambda *_a, **_k: None, sleep=lambda _s: None)
+    descargado = mercado.fetch_history(["CCJ", "NVO"], hoy - timedelta(days=400))
+    if set(descargado.histories) != {"CCJ", "NVO"}:
+        raise CheckFailure(f"el histórico simulado no llega: {descargado.failures}")
+    ajustes = Settings()
+    reglas = ajustes.radar.rules(ajustes.mandate.rules(), MandateState.OPTIMAL)
+
+    def filtrar(simbolo: str):
+        h = descargado.histories[simbolo]
+        return apply_filter(PriceHistory(simbolo, h.currency, h.bars, ahora, PriceSource.MARKET),
+                            hoy, reglas)
+
+    dispara, no = filtrar("CCJ"), filtrar("NVO")
+    if not dispara.passed or (dispara.stop, dispara.target) != (Decimal("71.76"),
+                                                                Decimal("101.00")):
+        raise CheckFailure(f"el filtro no dispara con un caso realista: {dispara.reason}")
+    if no.failure is not FilterFailure.RATIO:
+        raise CheckFailure(f"el filtro no descarta por el ratio: {no.reason}")
+
+    pedidos: list[dict] = []
+    exploracion = _sse_message([({"type": "text", "text": ""}, [{
+        "type": "text_delta",
+        "text": "## Cameco (CCJ)\nContratos. Entrar a 40 $ con stop en 35 $.\n\n"
+                "## Conclusión de la exploración\n- Energía.",
+    }])], "end_turn", 5_000, 500)
+    candidatos = json.dumps({"candidates": [{
+        "ticker": "CCJ", "yahoo_symbol": "CCJ", "name": "Cameco", "sector": "Energía",
+        "thesis": "Contratos. Stop en 35 $ y objetivo 90 $.", "invalidation": "Si baja.",
+    }]})
+
+    def responder(peticion: httpx2.Request) -> httpx2.Response:
+        cuerpo = json.loads(peticion.content)
+        pedidos.append(cuerpo)
+        if cuerpo.get("stream"):
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"},
+                                   content=exploracion)
+        return httpx2.Response(200, json={
+            "id": "msg_candidatos", "type": "message", "role": "assistant",
+            "model": "claude-opus-5", "content": [{"type": "text", "text": candidatos}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 1_000, "output_tokens": 100},
+        })
+
+    def cliente(clave: str) -> ClaudeClient:
+        http = anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(responder))
+        return ClaudeClient(clave, http_client=http, sdk=anthropic.Client,
+                            wait=lambda _s, _c: None)
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_h11_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+        try:
+            db.migrate()
+            with db.transaction() as conn:
+                CashMovementRepository(conn).add(CashMovement(hoy, CashKind.INITIAL,
+                                                              Decimal("10000")))
+            valoracion = load_valuation(db.connection(), ahora)
+            hecho = create_exploration(db, valoracion, ajustes, lambda: ahora, "sk-ant-x",
+                                       mercado, client_factory=cliente)
+            guardadas = RadarAlertRepository(db.connection()).list_all()
+        finally:
+            db.close_all()
+
+    if pedidos[0].get("tools") != [{"type": "web_search_20250305", "name": "web_search",
+                                    "max_uses": 30}]:
+        raise CheckFailure("el explorador no pide la búsqueda web")
+    formato = (pedidos[-1].get("output_config") or {}).get("format") or {}
+    if formato.get("type") != "json_schema":
+        raise CheckFailure("la extracción del explorador no va con salida estructurada")
+    if not hecho.report.used_ai or len(guardadas) != 1:
+        raise CheckFailure(f"la exploración no deja su informe y su alerta: {hecho.run.detail}")
+    [alerta] = guardadas
+    if alerta.status is not AlertStatus.ACTIVE or (alerta.stop, alerta.target) != (
+        Decimal("71.76"), Decimal("101.00")
+    ):
+        raise CheckFailure("la alerta del explorador no lleva los niveles del filtro")
+    return (
+        "histórico con máximos y mínimos de un yfinance simulado; el filtro dispara con un caso "
+        "realista y descarta por ratio; el candidato no tiene campos de precio; explorador con "
+        "búsqueda web y salida estructurada servido en local, con los niveles del filtro"
+    )
+
+
 def _check_levels() -> str:
     """H7: stop, objetivo y su propuesta, niveles en otra divisa y NO VERIFICABLE, y en una base
     de datos temporal, una tesis con su historial y un solo aviso de stop al día."""
@@ -1154,6 +1302,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Operaciones y efectivo", _check_trades),
         Check("Claude e informe diario", _check_claude),
         Check("Semanal y mensual", _check_weekly_monthly),
+        Check("Radar de oportunidades", _check_radar),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

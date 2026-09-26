@@ -223,6 +223,65 @@ def timeout_error() -> anthropic.APITimeoutError:
     return anthropic.APITimeoutError(request=_PETICION)
 
 
+# -- series de precios inventadas (radar) ---------------------------------------------------
+
+
+def dias_habiles(hasta, n):
+    """Los `n` últimos días de lunes a viernes que acaban en `hasta` (incluido si lo es)."""
+    from datetime import timedelta
+
+    dias = []
+    dia = hasta
+    while len(dias) < n:
+        if dia.weekday() < 5:
+            dias.append(dia)
+        dia -= timedelta(days=1)
+    return list(reversed(dias))
+
+
+def velas(cierres, *, hasta, rango="1", especiales=None):
+    """Velas diarias con esos cierres (del más antiguo al último, que cae en `hasta`): máximo y
+    mínimo a `rango` del cierre. `especiales[i] = (máximo, mínimo)` cambia la vela `i` (se puede
+    contar desde el final con índices negativos)."""
+    from decimal import Decimal
+
+    from sharky.core.radar import DailyBar
+
+    r = Decimal(rango)
+    dias = dias_habiles(hasta, len(cierres))
+    especiales = {(i % len(cierres)): v for i, v in (especiales or {}).items()}
+    barras = []
+    for i, (dia, cierre) in enumerate(zip(dias, cierres, strict=True)):
+        c = Decimal(str(cierre))
+        alto, bajo = especiales.get(i, (c + r, c - r))
+        barras.append(DailyBar(dia, Decimal(str(alto)), Decimal(str(bajo)), c))
+    return tuple(barras)
+
+
+def subida_y_caida(hasta, *, inicio="80", pico="100", final="78", dias=300, dia_pico=150,
+                   rango="1"):
+    """Una acción normal que sube de `inicio` a `pico` y cae hasta `final`, con un rango diario
+    de ±`rango` (ATR = 2 × rango): unos 14 meses de cotización."""
+    from decimal import Decimal
+
+    a, p, f = Decimal(inicio), Decimal(pico), Decimal(final)
+    cierres = []
+    for i in range(dias):
+        if i <= dia_pico:
+            valor = a + (p - a) * i / dia_pico
+        else:
+            valor = p + (f - p) * (i - dia_pico) / (dias - 1 - dia_pico)
+        cierres.append(valor.quantize(Decimal("0.01")))
+    return velas(cierres, hasta=hasta, rango=rango)
+
+
+def historico_yahoo(simbolo, barras, divisa="USD", nombre=None):
+    """Lo que «da Yahoo» de un símbolo para el radar (HistoryQuote)."""
+    from sharky.services.market import HistoryQuote
+
+    return HistoryQuote(simbolo, divisa, tuple(barras), nombre)
+
+
 # -- mercado ------------------------------------------------------------------------------
 
 
@@ -235,20 +294,52 @@ class FakeMarket:
     - `gate`: si se da, cada descarga espera a que se abra (para ver que la ventana no se
       congela o para cancelar a mitad).
 
-    Apunta lo que se le pide en `asked` y `asked_fx`.
+    - `histories`: el histórico diario que «da Yahoo» de cada símbolo (HistoryQuote), para el
+      radar.
+
+    Apunta lo que se le pide en `asked`, `asked_fx` y `asked_history`.
     """
 
     def __init__(self, quotes=None, rates=None, *, offline=False, suggestions=None, gate=None,
-                 search_error=None):
+                 search_error=None, histories=None):
         self.quotes = dict(quotes or {})
         self.rates = dict(rates or {})
         self.offline = offline
         self.suggestions = dict(suggestions or {})
         self.gate = gate
         self.search_error = search_error
+        self.histories = dict(histories or {})
         self.asked: list[list[str]] = []
         self.asked_fx: list[list[str]] = []
+        self.asked_history: list[list[str]] = []
         self.searched: list[str] = []
+
+    def fetch_history(self, symbols, since, progress=None, cancel=None):
+        from sharky.services.market import FailureKind, FetchFailure, HistoryResult
+
+        simbolos = list(symbols)
+        self.asked_history.append(simbolos)
+        series, fallos = {}, {}
+        for hechos, simbolo in enumerate(simbolos, 1):
+            if self.gate is not None:
+                self.gate.wait(10)
+            if cancel is not None and cancel.is_set():
+                for resto in simbolos[hechos - 1:]:
+                    fallos[resto] = FetchFailure(resto, FailureKind.CANCELLED, "Cancelada.")
+                return HistoryResult(series, fallos, cancelled=True)
+            if self.offline:
+                fallos[simbolo] = FetchFailure(simbolo, FailureKind.NETWORK,
+                                               "No se ha podido conectar con Yahoo.")
+            elif simbolo in self.histories:
+                series[simbolo] = self.histories[simbolo]
+            else:
+                fallos[simbolo] = FetchFailure(
+                    simbolo, FailureKind.NO_DATA,
+                    f"Yahoo no tiene cotizaciones recientes de {simbolo}.",
+                )
+            if progress is not None:
+                progress(hechos, len(simbolos))
+        return HistoryResult(series, fallos)
 
     def fetch_quotes(self, symbols, progress=None, cancel=None):
         from sharky.services.market import FailureKind, FetchFailure, FetchResult
@@ -303,7 +394,7 @@ class FakeMarket:
 
 
 class FakeTicker:
-    """Hace de `yfinance.Ticker` para un símbolo: cierres y metadatos inventados."""
+    """Hace de `yfinance.Ticker` para un símbolo: cierres (o velas) y metadatos inventados."""
 
     def __init__(self, yahoo, symbol):
         self._yahoo = yahoo
@@ -323,16 +414,23 @@ class FakeTicker:
             return pandas.DataFrame()
         cierres, divisa, nombre = serie
         indice = pandas.DatetimeIndex(
-            [pandas.Timestamp(dia) for dia, _ in cierres]
+            [pandas.Timestamp(fila[0]) for fila in cierres]
         ).tz_localize("Europe/Madrid")
         self.history_metadata = {"currency": divisa, "longName": nombre}
+        if cierres and len(cierres[0]) == 4:  # (día, máximo, mínimo, cierre)
+            return pandas.DataFrame({
+                "High": [f[1] for f in cierres],
+                "Low": [f[2] for f in cierres],
+                "Close": [f[3] for f in cierres],
+            }, index=indice)
         return pandas.DataFrame({"Close": [valor for _, valor in cierres]}, index=indice)
 
 
 class FakeYahoo:
     """yfinance de mentira para `YahooMarket(ticker_factory=…, search_factory=…, sleep=…)`.
 
-    - `series[símbolo] = ([(fecha, cierre), …], divisa, nombre)`.
+    - `series[símbolo] = ([(fecha, cierre), …], divisa, nombre)`, o con velas
+      `([(fecha, máximo, mínimo, cierre), …], divisa, nombre)`.
     - `errors[símbolo] = [excepción, …]`: se lanzan por orden en las primeras peticiones.
     - `search_quotes[consulta] = [dict, …]`: lo que devuelve una búsqueda.
 

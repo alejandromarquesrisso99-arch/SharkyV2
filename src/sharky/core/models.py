@@ -304,8 +304,10 @@ class WatchlistItem:
 class RadarAlert:
     """Tabla `alerts`: lo que sale del filtro del radar, pase o no (GUIA §5.8).
 
-    Un candidato descartado por el filtro se guarda igual, con su motivo en `reason` y sin los
-    niveles que no se pudieron calcular.
+    Un candidato descartado por el filtro se guarda igual, con su motivo en `reason`, sin los
+    niveles que no se pudieron calcular y sin peso máximo (solo lo tiene lo que pasó el filtro).
+    Nombre, símbolo, sector e invalidación (migración 4) guardan la idea del candidato para
+    poder añadirlo a vigilancia o comprarlo después.
     """
 
     created_on: date
@@ -322,6 +324,10 @@ class RadarAlert:
     summary: str = ""
     reason: str | None = None
     report_id: int | None = None
+    name: str | None = None
+    yahoo_symbol: str | None = None
+    sector: str | None = None
+    invalidation: str = ""
     id: int | None = None
 
 

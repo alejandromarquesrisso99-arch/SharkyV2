@@ -913,6 +913,7 @@ _SAVED_TEXT = {
     AIAction.DAILY: "Control diario guardado.",
     AIAction.WEEKLY: "Semanal guardado.",
     AIAction.MONTHLY: "Estudio mensual guardado.",
+    AIAction.EXPLORER: "Exploración guardada.",
 }
 
 

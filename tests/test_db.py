@@ -59,7 +59,35 @@ def test_migrar_otra_vez_tras_reabrir_no_cambia_nada(db):
 
 def test_estan_todas_las_tablas_de_la_guia(db):
     assert db.tables() == set(TABLES)
-    assert len(TABLES) == 14
+    assert len(TABLES) == 15  # las 14 de GUIA §5.1 y la caché del histórico del radar (H11)
+
+
+def test_migracion_4_historico_del_radar_y_la_idea_de_cada_candidato(tmp_path):
+    """Una base de datos del H10 (versión 3) gana la caché del histórico y las columnas de la
+    idea del candidato, sin perder las alertas que tuviera."""
+    from sharky.services.db import MIGRATIONS
+
+    vieja = Database(tmp_path / "h10.db", migrations=MIGRATIONS[:3])
+    try:
+        vieja.migrate()
+        with vieja.transaction() as conexion:
+            conexion.execute(
+                "INSERT INTO alerts (created_on, ticker, origin, status) "
+                "VALUES ('2026-09-01', 'CCJ', 'VIGILANCIA', 'ACTIVA')"
+            )
+    finally:
+        vieja.close_all()
+    db = Database(tmp_path / "h10.db")
+    try:
+        assert db.migrate() == 1
+        assert db.user_version() == 4
+        columnas = {fila[1] for fila in db.connection().execute("PRAGMA table_info(alerts)")}
+        assert {"name", "yahoo_symbol", "sector", "invalidation"} <= columnas
+        fila = db.connection().execute("SELECT ticker, invalidation FROM alerts").fetchone()
+        assert tuple(fila) == ("CCJ", "")
+        assert "price_history" in db.tables()
+    finally:
+        db.close_all()
 
 
 def test_solo_se_aplican_las_migraciones_pendientes(tmp_path):
@@ -250,7 +278,7 @@ def test_la_migracion_3_da_coste_al_registro(tmp_path):
             )
     finally:
         vieja.close_all()
-    nueva = Database(ruta)
+    nueva = Database(ruta, MIGRATIONS[:3])
     try:
         assert nueva.migrate() == 1
         fila = nueva.connection().execute("SELECT cost_usd FROM runs").fetchone()

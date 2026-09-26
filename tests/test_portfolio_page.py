@@ -31,7 +31,6 @@ from sharky.services.repositories import (
     TradeRepository,
 )
 from sharky.ui.main_window import MainWindow
-from sharky.ui.pages import PlaceholderPage
 from sharky.ui.panel import PanelPage
 from sharky.ui.portfolio import (
     Col,
@@ -449,7 +448,9 @@ def test_la_ventana_con_mercado_tiene_cartera_y_sus_botones(qtbot, qapp, cartera
     # Panel y Cartera comparten la misma descarga de precios.
     assert pagina.refresher is ventana.refresher
     assert isinstance(ventana.page("operar"), TradePage)
-    assert isinstance(ventana.page("radar"), PlaceholderPage)
+    from sharky.ui.radar import RadarPage
+
+    assert isinstance(ventana.page("radar"), RadarPage)
     ventana.shutdown()
 
 

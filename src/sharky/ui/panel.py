@@ -10,7 +10,7 @@
 - Gráfico del valor por participación (pyqtgraph).
 - Tarjetas «Control diario» (H9), «Noticias semanales» y «Estudio mensual» (H10), en
   ui/reports.py: qué toca, la conclusión, «Leer» y «Ejecutar ahora» con su precio aproximado.
-  La del radar: «Próximamente» hasta H11.
+- «Oportunidades en radar» (H11, en ui/radar.py): las alertas activas y «Abrir Radar».
 
 Todo lo que se enseña sale de core (valoración, foto del NAV y auditoría); aquí no se calcula
 ni un euro. El Panel no escribe en la base de datos: la foto del día y los incumplimientos se
@@ -87,6 +87,7 @@ from sharky.services.settings import Settings
 from sharky.ui import theme as theme_module
 from sharky.ui.pages import card, muted, restyle, set_state, state_label
 from sharky.ui.portfolio import PriceRefresher, RefreshOutcome, RefreshProgress
+from sharky.ui.radar import RadarCard
 from sharky.ui.reports import DailyCard, MonthlyCard, ReportCard, ReportRunner, WeeklyCard
 from sharky.ui.theme import ThemeController
 
@@ -532,10 +533,10 @@ class PanelPage(QWidget):
                 ("Estudio mensual", "El estudio del mes con un veredicto por posición."),
             ):
                 derecha.addWidget(coming_soon(titulo, texto))
-        derecha.addWidget(coming_soon(
-            "Oportunidades en radar", "Las alertas activas del radar y el acceso a la pantalla "
-            "Radar. Llega en el hito H11."
-        ))
+        #: «Oportunidades en radar» (H11): las alertas activas y el acceso al Radar.
+        self.radar_card = RadarCard(db, now=now)
+        self.radar_card.openRequested.connect(lambda: self.navigateRequested.emit("radar", ""))
+        derecha.addWidget(self.radar_card)
         derecha.addStretch(1)
         abajo.addLayout(derecha, 2)
         caja.addLayout(abajo)
@@ -654,6 +655,7 @@ class PanelPage(QWidget):
         self._show(valoracion, ahora)
         for tarjeta in self.report_cards:
             tarjeta.refresh()
+        self.radar_card.refresh()
 
     def _show(self, valuation: Valuation, now: datetime) -> None:
         datos = panel_data(

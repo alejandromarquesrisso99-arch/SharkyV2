@@ -11,6 +11,10 @@ compra ha abierto una tesis, la enseña en Tesis para completarla.
 Los tres informes (H9 y H10) los lanza el `ReportRunner` que comparten el Panel y los Informes;
 «Leer» lleva a Informes con ese informe abierto. Cuando el estudio mensual deja revisiones y
 propuestas en las tesis, Tesis se vuelve a leer.
+
+El Radar (H11) usa el mismo `ReportRunner` para «Buscar oportunidades nuevas» y un `RadarRunner`
+para el filtro gratis. «Comprar» en una alerta abre Operar con sus niveles; el botón Radar del
+lateral lleva cuántas alertas hay activas.
 """
 
 from __future__ import annotations
@@ -38,12 +42,15 @@ from sharky import paths
 from sharky.core.formatting import format_pct
 from sharky.core.levels import LevelCheck
 from sharky.core.mandate import STATE_LABELS, STATE_TOKENS
+from sharky.core.models import RadarAlert
 from sharky.services.db import Database
+from sharky.services.explorer import ExplorationOutcome
 from sharky.services.market import FxProvider, PriceProvider, local_now
 from sharky.services.settings import Settings, SettingsStore
 from sharky.ui.pages import SECTIONS, Section, SettingsPage, build_page, restyle
 from sharky.ui.panel import TOKEN_STYLE, PanelPage, day_text, short_when
 from sharky.ui.portfolio import PortfolioPage, PriceRefresher
+from sharky.ui.radar import RadarPage, RadarRunner, active_count
 from sharky.ui.reports import ReportRunner, ReportsPage
 from sharky.ui.theme import Theme, ThemeController
 from sharky.ui.theses import LevelNotifier, StopAlertDialog, ThesesPage
@@ -106,6 +113,14 @@ class MainWindow(QMainWindow):
                 db, self.refresher, self._settings, now=now or local_now, parent=self,
                 **(runner_options or {}),
             )
+        #: «Pasar el filtro ahora (gratis)» del Radar (el paso 3 de la rutina).
+        self.radar_runner: RadarRunner | None = None
+        if db is not None and market is not None and self.refresher is not None:
+            refresco = self.refresher
+            self.radar_runner = RadarRunner(
+                db, market, self._settings, now=now or local_now,
+                market_at=lambda: refresco.market_at, parent=self,
+            )
 
         self.setWindowIcon(QIcon(str(paths.icon_path())))
         self.setMinimumSize(1040, 680)
@@ -145,8 +160,14 @@ class MainWindow(QMainWindow):
         if isinstance(operar, TradePage):
             operar.recorded.connect(self._on_levels_changed)
             operar.thesisOpened.connect(lambda ticker: self.navigate("tesis", ticker))
+        radar = self._pages.get("radar")
+        if isinstance(radar, RadarPage):
+            radar.buyRequested.connect(self.buy_from_alert)
+            radar.alertsChanged.connect(self._on_radar_changed)
         if self.reports_runner is not None:
             self.reports_runner.finished.connect(self._on_report_done)
+        if self.radar_runner is not None:
+            self.radar_runner.finished.connect(self._on_radar_changed)
 
         self._sync_sidebar()
         self.show_section(SECTIONS[0].key)
@@ -208,6 +229,16 @@ class MainWindow(QMainWindow):
             self.attention_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.attention_badge.setVisible(False)
             fila.addWidget(self.attention_badge)
+        if section.key == "radar":
+            # Cuántas alertas activas hay: no exigen actuar, así que sin color de estado.
+            fila = QHBoxLayout(boton)
+            fila.setContentsMargins(0, 0, 12, 0)
+            fila.addStretch(1)
+            self.radar_badge = QLabel()
+            self.radar_badge.setObjectName("badgeNeutral")
+            self.radar_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.radar_badge.setVisible(False)
+            fila.addWidget(self.radar_badge)
         return boton
 
     def _build_sidebar_footer(self) -> QWidget:
@@ -270,6 +301,7 @@ class MainWindow(QMainWindow):
                 refresher=self.refresher,
                 runner=self.reports_runner,
                 store=self._store,
+                radar_runner=self.radar_runner,
             )
             if isinstance(pagina, SettingsPage):
                 pagina.restartRequested.connect(self.restartRequested)
@@ -315,6 +347,31 @@ class MainWindow(QMainWindow):
         if ticker and isinstance(pagina, PortfolioPage | ThesesPage):
             pagina.select_ticker(ticker)
 
+    def buy_from_alert(self, alert: RadarAlert) -> None:
+        """«Comprar» en una alerta del Radar: Operar, con sus niveles ya puestos."""
+        operar = self._pages.get("operar")
+        if not isinstance(operar, TradePage):
+            return
+        operar.prefill_from_alert(alert)
+        self.show_section("operar")
+
+    def _on_radar_changed(self, *_args: object) -> None:
+        """Han cambiado las alertas del radar: la tarjeta del Panel y el lateral."""
+        panel = self._pages.get("panel")
+        if isinstance(panel, PanelPage):
+            panel.radar_card.refresh()
+        self._sync_radar_badge()
+
+    def _sync_radar_badge(self) -> None:
+        if self._db is None or not hasattr(self, "radar_badge"):
+            return
+        n = active_count(self._db)
+        self.radar_badge.setText(str(n))
+        self.radar_badge.setToolTip(
+            "1 alerta activa en el radar" if n == 1 else f"{n} alertas activas en el radar"
+        )
+        self.radar_badge.setVisible(n > 0)
+
     def open_report(self, report_id: int) -> None:
         """«Leer» en el Panel: Informes, con ese informe abierto."""
         self.show_section("informes")
@@ -334,6 +391,8 @@ class MainWindow(QMainWindow):
             tesis = self._pages.get("tesis")
             if isinstance(tesis, ThesesPage):
                 tesis.reload()
+        if isinstance(outcome, ExplorationOutcome):
+            self._on_radar_changed()
 
     # -- avisos de niveles -----------------------------------------------------------------
 
@@ -389,11 +448,17 @@ class MainWindow(QMainWindow):
         panel = self._pages.get("panel")
         if isinstance(panel, PanelPage) and not panel.refreshing:
             panel.reload()
+        radar = self._pages.get("radar")
+        if isinstance(radar, RadarPage):
+            radar.reload()  # una compra deja su alerta como ejecutada
+        self._sync_radar_badge()
 
     def shutdown(self) -> None:
         """Al salir: que las páginas corten lo que tengan a medias en segundo plano."""
         if self.reports_runner is not None:
             self.reports_runner.shutdown()
+        if self.radar_runner is not None:
+            self.radar_runner.shutdown()
         if self.refresher is not None:
             self.refresher.shutdown()
         for dialogo in list(self.stop_dialogs):
@@ -441,6 +506,7 @@ class MainWindow(QMainWindow):
         )
         restyle(self.attention_badge, f"badge{TOKEN_STYLE[datos.attention_token]}")
         self.attention_badge.setVisible(n > 0)
+        self._sync_radar_badge()
 
     def _sync_theme_button(self, *_args: object) -> None:
         oscuro = self._theme.effective is Theme.DARK

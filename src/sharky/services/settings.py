@@ -25,6 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from sharky import paths
 from sharky.core.mandate import MandateRules
+from sharky.core.models import MandateState
+from sharky.core.radar import RadarRules
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +141,23 @@ class RadarSettings(_Section):
         if self.min_stop_distance_pct >= self.max_stop_distance_pct:
             raise ValueError("la distancia mínima del stop tiene que ser menor que la máxima")
         return self
+
+    def rules(self, mandate: MandateRules, state: MandateState) -> RadarRules:
+        """Los umbrales para core: los del radar, el ratio mínimo del mandato y el tope por
+        activo del estado (el peso máximo sugerido)."""
+
+        def fraccion(porcentaje: float) -> Decimal:
+            return Decimal(repr(porcentaje)) / 100
+
+        return RadarRules.from_mandate(
+            mandate,
+            state,
+            min_drop=fraccion(self.min_drop_from_high_pct),
+            max_drop=fraccion(self.max_drop_from_high_pct),
+            min_stop=fraccion(self.min_stop_distance_pct),
+            max_stop=fraccion(self.max_stop_distance_pct),
+            validity_days=self.alert_validity_days,
+        )
 
 
 class AutomationSettings(_Section):

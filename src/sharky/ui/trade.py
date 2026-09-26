@@ -69,6 +69,7 @@ from sharky.core.models import (
     CashKind,
     CashMovement,
     MandateState,
+    RadarAlert,
     Thesis,
     TradeKind,
 )
@@ -221,6 +222,8 @@ def done_text(recorded: RecordedTrade) -> str:
         texto += " Tu decisión sobre su tesis queda en el historial."
     elif recorded.closed_thesis is not None:
         texto += " Su tesis se ha cerrado."
+    if recorded.executed_alert is not None:
+        texto += " Su alerta del radar queda como ejecutada."
     return texto
 
 
@@ -363,6 +366,10 @@ class TradePage(QWidget):
         self.buy_button.setChecked(True)
         self._mode_group.buttonToggled.connect(lambda _b, marcado: marcado and self._on_mode())
         caja.addLayout(selector)
+        #: «Comprar» desde una alerta del radar: de dónde salen los niveles propuestos.
+        self.alert_note = state_label(state="muted")
+        self.alert_note.setVisible(False)
+        caja.addWidget(self.alert_note)
 
         self.ticker_edit = QLineEdit()
         self.ticker_edit.setPlaceholderText("ASML")
@@ -1076,7 +1083,44 @@ class TradePage(QWidget):
         self._hide_review()
         set_state(self.error_label, "", "dangerText")
         set_state(self.done_label, "", "okText")
+        set_state(self.alert_note, "", "muted")
         self._on_ticker()
+
+    def prefill_from_alert(self, alert: RadarAlert) -> None:
+        """«Comprar» en una alerta del radar (GUIA §5.8): una compra de ese ticker con el stop y
+        el objetivo del filtro ya puestos y, si el activo es nuevo, sus datos. Las unidades y el
+        precio son los de tu compra real; los niveles se pueden cambiar, y la tesis se abre con
+        los que registres."""
+        if not self.is_buy:
+            self.buy_button.setChecked(True)
+        self.clear()
+        self.ticker_edit.setText(alert.ticker)
+        divisa = alert.currency
+        if divisa:
+            self._prefill(self.currency_combo, divisa)
+            self._prefill(self.levels_combo, divisa)
+        if alert.stop is not None:
+            self._prefill(self.stop_edit, _plain(alert.stop))
+        if alert.target is not None:
+            self._prefill(self.target_edit, _plain(alert.target))
+        if self.asset() is None:
+            self._prefill(self.name_edit, alert.name or alert.ticker)
+            if alert.yahoo_symbol:
+                self._prefill(self.symbol_edit, alert.yahoo_symbol)
+            if divisa:
+                self._prefill(self.quote_currency_edit, divisa)
+            if alert.sector:
+                self._prefill(self.sector_edit, alert.sector)
+        precio = (f" con el precio de {format_level(alert.price, divisa)}"
+                  if alert.price is not None and divisa else "")
+        set_state(
+            self.alert_note,
+            f"Desde la alerta del radar del {alert.created_on:%d/%m/%Y}: stop y objetivo "
+            f"calculados por el filtro{precio}. Escribe las unidades y el precio de tu compra "
+            "real; si cambias los niveles, la tesis se abre con los tuyos.",
+            "muted",
+        )
+        self.units_edit.setFocus()
 
     # -- diálogos (los tests los sustituyen) ---------------------------------------------
 

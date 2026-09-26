@@ -214,6 +214,11 @@ _STYLESHEET = Template(
     }
     QLabel#badgeDanger { background-color: $danger; }
     QLabel#badgeWarn { background-color: $warn; }
+    QLabel#badgeNeutral {
+        background-color: $surface_alt; color: $text_muted; border: 1px solid $border;
+        border-radius: 9px; padding: 0px 6px; font-weight: 700; min-height: 16px;
+        max-height: 16px;
+    }
 
     QLabel#dotDanger, QLabel#dotWarn, QLabel#dotOk {
         border-radius: 5px; min-width: 10px; max-width: 10px; min-height: 10px; max-height: 10px;

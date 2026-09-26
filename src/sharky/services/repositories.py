@@ -10,8 +10,9 @@ transacción:
 Escribir fuera de una transacción es un error de programación y se rechaza.
 
 Aquí está lo común (dar de alta, consultar y listar) y lo propio de cada hito: la foto del NAV
-y la auditoría (H6), las tesis y la vigilancia de sus niveles (H7), y el registro de las
-operaciones y de los movimientos de efectivo (H8).
+y la auditoría (H6), las tesis y la vigilancia de sus niveles (H7), el registro de las
+operaciones y de los movimientos de efectivo (H8), y las alertas del radar y la caché de su
+histórico (H11).
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from functools import cache
 from typing import Any
 
 from sharky.core.csv_import import Opening
-from sharky.core.formatting import format_eur, format_units
+from sharky.core.formatting import format_eur, format_price, format_units
 from sharky.core.ledger import (
     MANUAL_CASH_SIGNS,
     ZERO,
@@ -108,11 +109,13 @@ from sharky.core.models import (
     TradeKind,
     WatchlistItem,
 )
+from sharky.core.radar import DailyBar, PriceHistory
 from sharky.core.valuation import (
     BASE_CURRENCY,
     Valuation,
     fx_currency,
     normalize_currency,
+    source_of,
     to_eur_rate,
     value_portfolio,
 )
@@ -490,18 +493,99 @@ class WatchlistRepository(_Repository):
         _require_transaction(self.conn)
         return self.conn.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker,)).rowcount > 0
 
+    def get(self, ticker: str) -> WatchlistItem | None:
+        """El valor de ese ticker, sin distinguir mayúsculas."""
+        return next((w for w in self.list_all() if w.ticker.upper() == ticker.strip().upper()),
+                    None)
+
     def list_all(self) -> list[WatchlistItem]:
         return self._select(order="ticker")
 
 
 class RadarAlertRepository(_Repository):
+    """Tabla `alerts`: las alertas del radar y los descartes del filtro (GUIA §5.8)."""
+
     table, record = "alerts", RadarAlert
 
     def add(self, alert: RadarAlert) -> int:
         return _insert(self.conn, self.table, alert)
 
+    def get(self, alert_id: int) -> RadarAlert | None:
+        return self._one("id = ?", (alert_id,))
+
+    def list_all(self) -> list[RadarAlert]:
+        return self._select(order="created_on, id")
+
     def list_by_status(self, status: AlertStatus) -> list[RadarAlert]:
         return self._select("status = ?", (status.value,), order="created_on, id")
+
+    def active(self) -> list[RadarAlert]:
+        return self.list_by_status(AlertStatus.ACTIVE)
+
+    def active_for(self, ticker: str) -> RadarAlert | None:
+        """La alerta activa de ese ticker, sin distinguir mayúsculas."""
+        return next((a for a in self.active() if a.ticker.upper() == ticker.strip().upper()),
+                    None)
+
+    def close(self, alert_id: int, status: AlertStatus, reason: str) -> bool:
+        """Una alerta activa pasa a EJECUTADA, EXPIRADA o DESCARTADA, con su motivo. False si
+        ya no estaba activa."""
+        _require_transaction(self.conn)
+        if status is AlertStatus.ACTIVE:
+            raise ValueError("Una alerta se cierra con otro estado, no ACTIVA")
+        cursor = self.conn.execute(
+            "UPDATE alerts SET status = ?, reason = ? WHERE id = ? AND status = ?",
+            (status.value, reason, alert_id, AlertStatus.ACTIVE.value),
+        )
+        return cursor.rowcount > 0
+
+    def delete_rejections(self, ticker: str, day: date) -> int:
+        """Borra los descartes del filtro de ese ticker hechos ese día: cada pasada deja solo
+        su último resultado del día (la rutina repite el filtro cada hora)."""
+        _require_transaction(self.conn)
+        return self.conn.execute(
+            "DELETE FROM alerts WHERE upper(ticker) = upper(?) AND created_on = ? AND "
+            "status = ? AND max_weight IS NULL",
+            (ticker, day.isoformat(), AlertStatus.DISCARDED.value),
+        ).rowcount
+
+
+class PriceHistoryRepository:
+    """Tabla `price_history` (migración 4): la caché del histórico diario del radar, por
+    símbolo de Yahoo. Cada descarga sustituye a la anterior entera."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def replace(self, symbol: str, currency: str, bars: Sequence[DailyBar],
+                fetched_at: datetime) -> None:
+        _require_transaction(self.conn)
+        self.conn.execute("DELETE FROM price_history WHERE symbol = ?", (symbol,))
+        self.conn.executemany(
+            "INSERT INTO price_history (symbol, bar_date, high, low, close, currency, "
+            "fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(symbol, to_db(b.day), to_db(b.high), to_db(b.low), to_db(b.close), currency,
+              to_db(fetched_at)) for b in bars],
+        )
+
+    def load(self, symbol: str, now: datetime,
+             market_at: datetime | None = None) -> PriceHistory | None:
+        """El histórico guardado, con su procedencia vista ahora (CACHE si tiene menos de 24 h;
+        MERCADO si es de `market_at`). None si no hay nada."""
+        filas = self.conn.execute(
+            "SELECT bar_date, high, low, close, currency, fetched_at FROM price_history "
+            "WHERE symbol = ? ORDER BY bar_date", (symbol,),
+        ).fetchall()
+        if not filas:
+            return None
+        barras = tuple(
+            DailyBar(date.fromisoformat(f["bar_date"]), Decimal(f["high"]), Decimal(f["low"]),
+                     Decimal(f["close"]))
+            for f in filas
+        )
+        descargado = datetime.fromisoformat(filas[-1]["fetched_at"])
+        return PriceHistory(symbol, filas[-1]["currency"], barras, descargado,
+                            source_of(descargado, now, market_at))
 
 
 class ReportRepository(_Repository):
@@ -1048,6 +1132,7 @@ class RecordedTrade:
     opened_thesis: int | None = None
     updated_thesis: int | None = None
     closed_thesis: int | None = None
+    executed_alert: int | None = None  # la alerta del radar que ha quedado EJECUTADA
 
 
 def portfolio_start(conn: sqlite3.Connection) -> date | None:
@@ -1313,6 +1398,9 @@ def record_trade(
     - Ampliar una tesis con otros niveles necesita `choice` (lo que el usuario decide).
     - Vender toda la posición cierra su tesis con el PnL realizado de toda la posición y el
       motivo; una venta parcial no la toca.
+    - Comprar un ticker con una alerta activa del radar la deja EJECUTADA, se compre desde
+      «Comprar» o escribiéndolo a mano (decidido en el H11). La tesis se abre con los niveles de
+      esta compra, no con los de la alerta.
     """
     _require_transaction(conn)
     revision = review_trade(conn, ticket, rules, now, market_at)
@@ -1369,9 +1457,27 @@ def record_trade(
                      now)
         cerrada = tesis.id
 
+    ejecutada = execute_radar_alert(conn, operacion) if op.is_buy else None
     log.info("%s registrada: %s %s%s", "Compra" if op.is_buy else "Venta",
              format_units(op.units), op.ticker, " (forzada)" if forzada else "")
-    return RecordedTrade(operacion, movimiento, revision, forzada, abierta, actualizada, cerrada)
+    return RecordedTrade(operacion, movimiento, revision, forzada, abierta, actualizada, cerrada,
+                         ejecutada)
+
+
+def execute_radar_alert(conn: sqlite3.Connection, trade: Trade) -> int | None:
+    """Una compra de un ticker con alerta activa del radar la deja EJECUTADA (GUIA §5.8), con
+    lo que se compró de verdad como motivo. Devuelve la alerta, si la había."""
+    alertas = RadarAlertRepository(conn)
+    alerta = alertas.active_for(trade.ticker)
+    if alerta is None or alerta.id is None:
+        return None
+    motivo = (
+        f"Comprada el {trade.trade_date:%d/%m/%Y}: {format_units(trade.units)} a "
+        f"{format_price(trade.price)} {trade.currency}."
+    )
+    alertas.close(alerta.id, AlertStatus.EXECUTED, motivo)
+    log.info("Alerta del radar de %s ejecutada", trade.ticker)
+    return alerta.id
 
 
 # -- movimientos de efectivo sueltos ---------------------------------------------------------
