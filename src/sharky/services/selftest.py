@@ -4,8 +4,8 @@ Comprueba que dentro del programa está todo lo que necesita para arrancar: Qt, 
 datos (esquema, migraciones, copia y restauración), los ajustes, la plantilla CSV del asistente,
 los precios y la valoración (con un Yahoo simulado), el mandato y la foto del NAV, las tesis y
 la vigilancia de sus niveles, las operaciones, el control diario con Claude (con una respuesta
-servida en local), el Administrador de credenciales, las bibliotecas de mercado e IA y los
-recursos del paquete. Todo
+servida en local), el semanal con búsqueda web y el mensual en dos pasos (también en local), el
+Administrador de credenciales, las bibliotecas de mercado e IA y los recursos del paquete. Todo
 lo que escribe va a una carpeta temporal: nunca toca los datos del usuario ni su clave.
 Con `--online` añade una cotización real con su tipo de cambio y una conexión TLS con la API
 de Claude.
@@ -716,6 +716,219 @@ def _check_claude() -> str:
     )
 
 
+def _sse(events: Sequence[tuple[str, dict]]) -> bytes:
+    """Una respuesta por streaming (SSE) como las de la API, para servirla en local."""
+    import json
+
+    return "".join(
+        f"event: {nombre}\ndata: {json.dumps(datos, ensure_ascii=False)}\n\n"
+        for nombre, datos in events
+    ).encode("utf-8")
+
+
+def _sse_message(blocks: Sequence[tuple[dict, Sequence[dict]]], stop_reason: str,
+                 input_tokens: int, output_tokens: int, searches: int = 0) -> bytes:
+    """Un mensaje completo por streaming: cada bloque con su inicio, sus deltas y su final."""
+    eventos: list[tuple[str, dict]] = [("message_start", {
+        "type": "message_start",
+        "message": {"id": "msg_autocomprobacion", "type": "message", "role": "assistant",
+                    "model": "claude-sonnet-5", "content": [], "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 1}},
+    })]
+    for n, (inicio, deltas) in enumerate(blocks):
+        eventos.append(("content_block_start", {"type": "content_block_start", "index": n,
+                                                "content_block": inicio}))
+        eventos += [("content_block_delta", {"type": "content_block_delta", "index": n,
+                                             "delta": d}) for d in deltas]
+        eventos.append(("content_block_stop", {"type": "content_block_stop", "index": n}))
+    uso: dict = {"output_tokens": output_tokens}
+    if searches:
+        uso["server_tool_use"] = {"web_search_requests": searches}
+    eventos += [
+        ("message_delta", {"type": "message_delta",
+                           "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                           "usage": uso}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return _sse(eventos)
+
+
+_SOURCE_URL = "https://ejemplo.es/santander"
+
+
+def _weekly_responses() -> list[bytes]:
+    """El semanal: Claude busca, pausa el turno (`pause_turn`) y lo termina con una cita."""
+    busqueda = ({"type": "server_tool_use", "id": "srvtoolu_01", "name": "web_search",
+                 "input": {}},
+                [{"type": "input_json_delta", "partial_json": '{"query": "Santander"}'}])
+    resultados = ({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_01", "content": [
+        {"type": "web_search_result", "url": _SOURCE_URL, "title": "Santander",
+         "encrypted_content": "cifrado", "page_age": None}]}, [])
+    pausa = _sse_message([
+        ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Busco. "}]),
+        busqueda, resultados,
+    ], "pause_turn", 3_000, 100, searches=1)
+    final = _sse_message([
+        ({"type": "text", "text": ""}, [
+            {"type": "citations_delta", "citation": {
+                "type": "web_search_result_location", "url": _SOURCE_URL,
+                "title": "Santander", "encrypted_index": "cifrado", "cited_text": "…"}},
+            {"type": "text_delta", "text": "## SAN\nRebaja previsiones."},
+        ]),
+        ({"type": "text", "text": ""}, [{"type": "text_delta",
+                                         "text": "\n\n## Conclusión de la semana\n- Ojo."}]),
+    ], "end_turn", 4_000, 300)
+    return [pausa, final]
+
+
+def _check_weekly_monthly() -> str:
+    """H10: los prompts del semanal y del mensual van dentro del programa; el SDK de verdad
+    procesa la búsqueda web con `pause_turn` (reenviando lo escrito tal cual) y sus citas, y
+    la extracción estructurada con `messages.parse` y pydantic; el veredicto se añade a la
+    tesis sin tocar sus números. Todo servido en local, sin red y sin clave real."""
+    import json
+
+    import anthropic
+    import httpx2
+
+    from sharky.core.models import (
+        Asset,
+        CashKind,
+        CashMovement,
+        Price,
+        PriceSource,
+        Thesis,
+        ThesisEventKind,
+        Trade,
+        TradeKind,
+    )
+    from sharky.core.schedule import Month
+    from sharky.services.ai import ClaudeClient
+    from sharky.services.db import Database
+    from sharky.services.reports import (
+        create_monthly_report,
+        create_weekly_report,
+        render_prompt,
+    )
+    from sharky.services.repositories import (
+        AssetRepository,
+        CashMovementRepository,
+        PriceRepository,
+        ThesisEventRepository,
+        ThesisRepository,
+        TradeRepository,
+        create_theses,
+        load_valuation,
+    )
+    from sharky.services.settings import Settings
+
+    for nombre, campos in (
+        ("semanal", ("desde", "hasta", "activos", "conclusiones_diarias", "prioritarias")),
+        ("mensual", ("mes", "valoracion", "incumplimientos", "tesis", "operaciones",
+                     "conclusiones_diarias", "semanales", "conclusion_anterior")),
+        ("mensual_extraccion", ("tickers", "estudio")),
+    ):
+        render_prompt(nombre, dict.fromkeys(campos, "-"))
+
+    d = Decimal
+    ajustes = Settings()
+    hoy = date(2026, 1, 30)
+    ahora = datetime(2026, 1, 30, 18, 0, tzinfo=UTC)
+    respuestas = _weekly_responses()
+    pedidos: list[dict] = []
+    extraccion = json.dumps({"verdicts": [{
+        "ticker": "SAN", "verdict": "mantener", "reason": "Aguanta.", "invalidation": "Nada.",
+        "proposed_stop": 4.3, "proposed_target": None,
+    }]})
+
+    def responder(peticion: httpx2.Request) -> httpx2.Response:
+        cuerpo = json.loads(peticion.content)
+        pedidos.append(cuerpo)
+        if cuerpo.get("stream"):
+            if respuestas:
+                contenido = respuestas.pop(0)
+            else:  # el estudio mensual
+                contenido = _sse_message([({"type": "text", "text": ""}, [{
+                    "type": "text_delta",
+                    "text": "## SAN\nSigue en pie.\n\n## Conclusión del mes\n- Subir el stop.",
+                }])], "end_turn", 6_000, 800)
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"},
+                                   content=contenido)
+        return httpx2.Response(200, json={
+            "id": "msg_extraccion", "type": "message", "role": "assistant",
+            "model": "claude-sonnet-5", "content": [{"type": "text", "text": extraccion}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 2_000, "output_tokens": 100},
+        })
+
+    def cliente(clave: str) -> ClaudeClient:
+        http = anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(responder))
+        return ClaudeClient(clave, http_client=http, sdk=anthropic.Client,
+                            wait=lambda _s, _c: None)
+
+    with tempfile.TemporaryDirectory(
+        prefix="sharky_selftest_h10_", ignore_cleanup_errors=True
+    ) as carpeta:
+        db = Database(Path(carpeta) / "sharky.db")
+        try:
+            db.migrate()
+            with db.transaction() as conn:
+                AssetRepository(conn).add(Asset("SAN", "Banco", "EUR", yahoo_symbol="SAN.MC",
+                                                sector="Banca"))
+                TradeRepository(conn).add(Trade(date(2026, 1, 1), "SAN", TradeKind.OPENING,
+                                                d(100), d(5), "EUR", d(1), d(0), d(500)))
+                PriceRepository(conn).save(Price("SAN", hoy, d(5), "EUR", PriceSource.MARKET,
+                                                 ahora))
+                CashMovementRepository(conn).add(CashMovement(date(2026, 1, 1),
+                                                              CashKind.INITIAL, d(9000)))
+                create_theses(conn, [Thesis("SAN", "EUR", hoy, entry_price=d(5),
+                                            stop=d("4.2"), target=d(7))], ahora)
+            valoracion = load_valuation(db.connection(), ahora)
+            semanal = create_weekly_report(db, valoracion, ajustes, lambda: ahora, "sk-ant-x",
+                                           client_factory=cliente)
+            antes = ThesisRepository(db.connection()).active_for("SAN")
+            mensual = create_monthly_report(db, valoracion, ajustes, lambda: ahora, "sk-ant-x",
+                                            Month(2026, 1), client_factory=cliente)
+            despues = ThesisRepository(db.connection()).active_for("SAN")
+            eventos = ThesisEventRepository(db.connection()).list_for(despues.id)
+        finally:
+            db.close_all()
+
+    primera, segunda = pedidos[0], pedidos[1]
+    if primera.get("tools") != [{"type": "web_search_20250305", "name": "web_search",
+                                 "max_uses": 3}]:
+        raise CheckFailure("el semanal no pide la búsqueda web de la guía")
+    reenviado = segunda["messages"][1] if len(segunda.get("messages", [])) == 2 else {}
+    tipos = [b.get("type") for b in reenviado.get("content", [])]
+    if reenviado.get("role") != "assistant" or tipos != ["text", "server_tool_use",
+                                                         "web_search_tool_result"]:
+        raise CheckFailure("el turno en pausa no se ha reenviado tal cual")
+    if "parsed_output" in json.dumps(reenviado) or "cifrado" not in json.dumps(reenviado):
+        raise CheckFailure("el reenvío del turno en pausa no lleva lo que devolvió la API")
+    informe = semanal.report
+    if not informe.used_ai or f"({_SOURCE_URL})" not in informe.markdown:
+        raise CheckFailure(f"el semanal no junta las fuentes citadas: {informe.error}")
+    if (informe.web_searches, informe.conclusion) != (1, "- Ojo."):
+        raise CheckFailure("el semanal no cuenta las búsquedas o no trae su conclusión")
+    extraer = pedidos[-1]
+    formato = (extraer.get("output_config") or {}).get("format") or {}
+    if extraer.get("stream") or formato.get("type") != "json_schema":
+        raise CheckFailure("la extracción del mensual no va con salida estructurada")
+    if extraer.get("thinking") != {"type": "disabled"}:
+        raise CheckFailure("la extracción del mensual no va sin razonamiento")
+    if "| SAN | MANTENER | 4,30 EUR |" not in mensual.report.markdown:
+        raise CheckFailure(f"el mensual no trae el veredicto: {mensual.verdicts_unavailable}")
+    propuestas = [e for e in eventos if e.kind is ThesisEventKind.PROPOSAL]
+    if antes != despues or len(propuestas) != 1:
+        raise CheckFailure("el veredicto ha tocado la tesis o no ha dejado su propuesta")
+    return (
+        "prompts dentro del programa; SDK de Claude servido en local (sin red ni clave): "
+        "semanal con búsqueda web, pause_turn reenviado tal cual y fuentes; mensual con "
+        "extracción estructurada y el veredicto en la tesis sin tocar sus números"
+    )
+
+
 def _check_levels() -> str:
     """H7: stop, objetivo y su propuesta, niveles en otra divisa y NO VERIFICABLE, y en una base
     de datos temporal, una tesis con su historial y un solo aviso de stop al día."""
@@ -940,6 +1153,7 @@ def build_checks(online: bool = False) -> list[Check]:
         Check("Tesis y niveles", _check_levels),
         Check("Operaciones y efectivo", _check_trades),
         Check("Claude e informe diario", _check_claude),
+        Check("Semanal y mensual", _check_weekly_monthly),
         Check("Administrador de credenciales", _check_keyring),
         Check("Bibliotecas", _check_libraries),
         Check("Recursos del paquete", _check_resources),

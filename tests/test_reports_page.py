@@ -12,16 +12,23 @@ from decimal import Decimal as D
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent
 
-from fakes import FakeMarket, connection_error
+from fakes import FakeMarket, connection_error, extraccion, mensaje_claude, texto_citado
 from sharky.core.models import Report, ReportKind, Run, RunStatus
 from sharky.core.reports import AIAction
+from sharky.core.schedule import Month
 from sharky.services import secrets
 from sharky.services.ai import ClaudeClient, KeyCheck, KeyStatus
 from sharky.services.market import FxQuote, Quote
 from sharky.services.repositories import ReportRepository, RunRepository
 from sharky.services.settings import Settings, SettingsStore
 from sharky.ui.main_window import MainWindow
-from sharky.ui.reports import DailyCard, ReportsPage, report_meta
+from sharky.ui.reports import (
+    EXTRACTION_STAGE,
+    DailyCard,
+    ReportsPage,
+    report_meta,
+    report_title,
+)
 from sharky.ui.settings import ClaudeCard
 from sharky.ui.theme import Theme, ThemeController
 from test_trades import AHORA, HOY, alta_tesis, crear_cartera
@@ -290,7 +297,7 @@ def test_se_pinta_en_los_dos_temas(qtbot, con_clave, ventana, tema):
             assert not ventana.grab().isNull()
 
 
-# -- Ajustes → Claude ----------------------------------------------------------------------------
+# -- Ajustes → Claude ---------------------------------------------------------------------------
 
 
 def claude(ventana) -> ClaudeCard:
@@ -406,3 +413,165 @@ def test_gasto_del_mes_y_estimaciones(ventana, cartera):
     card.refresh()
     assert card.spent_label.text() == "Gasto de septiembre: 1,23 $ de 10,00 $"
     assert card.estimate_labels[AIAction.DAILY].text() == "≈ 0,02–0,05 $"
+
+
+# -- H10: las tarjetas del semanal y del mensual ------------------------------------------------
+# La cartera se creó el domingo 20/09; hoy es el viernes 25/09.
+
+
+def ejecutar_tarjeta(qtbot, ventana, card, respuesta=True):
+    vistos = []
+
+    def confirmar(plan):
+        vistos.append(plan)
+        return respuesta
+
+    card.confirm_run = confirmar
+    with qtbot.waitSignal(ventana.reports_runner.stopped, timeout=10_000):
+        card.run_button.click()
+    return vistos[0]
+
+
+def test_las_tres_tarjetas_con_su_precio_y_lo_que_toca(con_clave, ventana):
+    panel = ventana.page("panel")
+    assert [type(t).__name__ for t in panel.report_cards] == ["DailyCard", "WeeklyCard",
+                                                               "MonthlyCard"]
+    semanal, mensual = panel.weekly_card, panel.monthly_card
+    assert semanal.run_button.text() == "Ejecutar ahora · ≈ 0,30–0,80 $"
+    assert mensual.run_button.text() == "Ejecutar ahora · ≈ 0,20–0,60 $"
+    # El semanal toca el domingo; el mensual, el 1 de noviembre (septiembre está a medias).
+    assert semanal.chip_label.text() == "Próximo: domingo 27/09"
+    assert "los domingos, o a los 7 días del último" in semanal.toolTip()
+    assert mensual.chip_label.text() == "Próximo: domingo 01/11"
+    assert semanal.when_label.text() == "Todavía no hay ningún semanal."
+    assert not semanal.read_button.isEnabled()
+
+
+def test_ejecutar_el_semanal(qtbot, con_clave, ventana, claude_falso):
+    claude_falso.respuestas = [mensaje_claude(bloques=[
+        texto_citado("## SAN\nRebaja previsiones.", ("https://ejemplo.es/san", "SAN")),
+        texto_citado("\n\n## Conclusión de la semana\n- SAN a la baja."),
+    ], busquedas=4)]
+    card = ventana.page("panel").weekly_card
+    etapas = []
+    ventana.reports_runner.stageChanged.connect(etapas.append)
+    plan = ejecutar_tarjeta(qtbot, ventana, card)
+    assert plan.action is AIAction.WEEKLY and plan.effort == "medium" and plan.existing is None
+    assert "Claude está buscando noticias en la web…" in etapas
+    assert claude_falso.streams[0]["tools"][0]["type"] == "web_search_20250305"
+    assert card.chip_label.text() == "Hecho hoy"
+    assert card.conclusion_label.text() == "• SAN a la baja."
+    assert card.message_label.text().startswith("Semanal guardado. Coste real: 0,05 $ (")
+    assert "4 búsquedas" in card.message_label.text()
+    # Las otras tarjetas no se dan por enteradas.
+    assert not ventana.page("panel").daily_card.message_label.isVisible()
+    pagina = informes(ventana)
+    assert pagina.current.kind is ReportKind.WEEKLY
+    assert pagina.heading_label.text() == "Noticias semanales — del 19/09 al 25/09 · 25/09/2026"
+    assert "[SAN](https://ejemplo.es/san)" in pagina.current.markdown
+
+
+def test_mientras_uno_corre_los_demas_esperan(qtbot, con_clave, ventana):
+    panel = ventana.page("panel")
+    panel.weekly_card.confirm_run = lambda plan: True
+    with qtbot.waitSignal(ventana.reports_runner.stopped, timeout=10_000):
+        panel.weekly_card.run_button.click()
+        assert not panel.daily_card.run_button.isEnabled()
+        assert not panel.monthly_card.run_button.isEnabled()
+        assert not panel.daily_card.progress.isVisible()
+    assert panel.daily_card.run_button.isEnabled()
+
+
+def test_ejecutar_el_mensual_deja_las_propuestas_en_tesis(qtbot, con_clave, ventana, cartera,
+                                                          claude_falso):
+    from sharky.services.reports import ExtractedVerdict, MonthlyVerdicts
+
+    claude_falso.respuestas = [mensaje_claude(
+        "## SAN\nEl stop está roto.\n\n## Conclusión del mes\n- Salir de SAN."
+    )]
+    claude_falso.extracciones = [extraccion(MonthlyVerdicts(verdicts=[ExtractedVerdict(
+        ticker="SAN", verdict="MANTENER", reason="Aguanta.", invalidation="Nada.",
+        proposed_stop=3.8, proposed_target=None,
+    )]))]
+    card = ventana.page("panel").monthly_card
+    etapas = []
+    ventana.reports_runner.stageChanged.connect(etapas.append)
+    plan = ejecutar_tarjeta(qtbot, ventana, card)
+    # Solo el mes en curso (la cartera es de septiembre): parcial.
+    assert [o.month for o in plan.month_options] == [Month(2026, 9)]
+    assert plan.study == Month(2026, 9) and plan.month_options[0].partial
+    assert EXTRACTION_STAGE in etapas
+    assert card.message_label.text().endswith("Añadidos a Tesis: 2 revisiones y propuestas.")
+    assert card.when_label.text().startswith("Último: septiembre 2026 (parcial), hoy")
+    # En Tesis, la propuesta de Claude, con «Aplicar».
+    tesis = ventana.page("tesis")
+    assert tesis.select_ticker("SAN")
+    fila = next(f for f in tesis.history_rows if f.apply_button is not None)
+    assert fila.title_label.text() == "Propuesta de Claude: stop 3,80 EUR"
+    assert fila.apply_button.isEnabled()
+    revision = next(f for f in tesis.history_rows if f.title_label.text() == "Revisión de Claude")
+    assert "MANTENER" in revision.detail_label.text()
+    informe = informes(ventana).current
+    assert informe.kind is ReportKind.MONTHLY
+    assert report_title(informe) == "Estudio mensual — septiembre 2026 (parcial)"
+
+
+def test_el_dialogo_del_mensual_deja_elegir_el_mes(qtbot, ventana, cartera):
+    from sharky.ui.reports import MonthlyRunDialog, MonthOption, RunPlan
+
+    Mes = Month
+
+    plan = ventana.reports_runner.plan(AIAction.MONTHLY)
+    existente = Report(ReportKind.MONTHLY, "2026-08", AHORA - timedelta(days=24), "…", True)
+    plan = RunPlan(plan.action, plan.model, plan.effort, True, True, plan.budget, None,
+                   plan.month, (MonthOption(Mes(2026, 8), False, existente),
+                                MonthOption(Mes(2026, 9), True, None)), Mes(2026, 8))
+    dialogo = MonthlyRunDialog(plan)
+    qtbot.addWidget(dialogo)
+    assert dialogo.chosen == Mes(2026, 8)
+    assert "Ya hay un estudio de ese mes (hecho el 01/09/2026): se sustituirá." in (
+        dialogo.info_label.text())
+    assert dialogo.accept_button.text() == "Ejecutar (≈ 0,20–0,60 $)"
+    dialogo.choose(Mes(2026, 9))
+    assert dialogo.chosen == Mes(2026, 9) and "se sustituirá" not in dialogo.info_label.text()
+    assert [b.text() for b in dialogo.month_buttons.values()] == [
+        "Mes anterior: agosto de 2026", "Mes en curso (parcial): septiembre de 2026, hasta hoy",
+    ]
+
+
+def test_titulos_de_semanales_y_mensuales():
+    semanal = Report(ReportKind.WEEKLY, "2026-09-27", AHORA, "", True)
+    assert report_title(semanal) == "Noticias semanales — del 21/09 al 27/09"
+    completo = Report(ReportKind.MONTHLY, "2026-08", AHORA, "", True)
+    assert report_title(completo) == "Estudio mensual — agosto 2026"
+    raro = Report(ReportKind.WEEKLY, "2026-W38", AHORA, "", True)
+    assert report_title(raro) == "Noticias semanales"
+
+
+def test_el_mes_que_se_propone(ventana, cartera):
+    runner = ventana.reports_runner
+    runner._now = lambda: AHORA.replace(month=10, day=3)  # reloj falso: sábado 03/10
+    # Septiembre (el primer mes, incompleto) no sale solo, pero a mano se propone él.
+    plan = runner.plan(AIAction.MONTHLY)
+    assert [o.month for o in plan.month_options] == [Month(2026, 9), Month(2026, 10)]
+    assert plan.study == Month(2026, 9) and plan.existing is None
+    # Con su estudio ya hecho, se propone el mes en curso.
+    guardar_informe(cartera, ReportKind.MONTHLY, periodo="2026-09",
+                    cuando=AHORA.replace(month=10, day=1))
+    plan = runner.plan(AIAction.MONTHLY)
+    assert plan.study == Month(2026, 10) and plan.existing is None
+    assert plan.option(Month(2026, 9)).existing is not None
+
+
+def test_la_tarjeta_del_mensual_dice_lo_que_toca(ventana, cartera):
+    card = ventana.page("panel").monthly_card
+    noviembre = AHORA.replace(month=11, day=2)  # reloj falso: lunes 02/11
+    ventana.reports_runner._now = card._now = lambda: noviembre
+    card.refresh()
+    assert card.chip_label.text() == "Toca: octubre" and card.chip.objectName() == "chipWarn"
+    guardar_informe(cartera, ReportKind.MONTHLY, periodo="2026-10", coste="0.41",
+                    cuando=noviembre.replace(day=1))
+    card.refresh()
+    assert card.chip_label.text() == "Hecho: octubre" and card.chip.objectName() == "chipOk"
+    assert card.when_label.text().startswith("octubre 2026, 01/11/2026")
+    assert card.conclusion_label.text() == "• Todo en orden."

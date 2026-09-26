@@ -86,6 +86,23 @@ def month_name(month: int) -> str:
     return MONTH_NAMES[month - 1]
 
 
+#: Los días de la semana, como `date.weekday()`: 0 = lunes … 6 = domingo.
+WEEKDAY_NAMES: tuple[str, ...] = (
+    "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
+)
+
+
+def weekday_name(weekday: int) -> str:
+    """6 → «domingo»."""
+    return WEEKDAY_NAMES[weekday]
+
+
+def weekday_plural(weekday: int) -> str:
+    """6 → «domingos»; 0 → «lunes»."""
+    nombre = WEEKDAY_NAMES[weekday]
+    return nombre + "s" if nombre.endswith("o") else nombre
+
+
 def format_limit_pct(fraction: Decimal) -> str:
     """Un límite del mandato, sin ceros de relleno: 0.10 → «10 %», 0.015 → «1,5 %»."""
     return f"{_spanish(fraction * 100, 2, trim=True)} %"

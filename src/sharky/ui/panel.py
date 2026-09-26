@@ -8,8 +8,9 @@
   niveles se calculan con cada valoración: siguen aquí mientras dure la condición, aunque la
   ventana de aviso y la notificación solo salgan una vez al día.
 - Gráfico del valor por participación (pyqtgraph).
-- Tarjeta «Control diario» (H9, ui/reports.py): conclusión, «Leer» y «Ejecutar ahora» con su
-  precio aproximado. Las del semanal, el mensual y el radar: «Próximamente» hasta H10 y H11.
+- Tarjetas «Control diario» (H9), «Noticias semanales» y «Estudio mensual» (H10), en
+  ui/reports.py: qué toca, la conclusión, «Leer» y «Ejecutar ahora» con su precio aproximado.
+  La del radar: «Próximamente» hasta H11.
 
 Todo lo que se enseña sale de core (valoración, foto del NAV y auditoría); aquí no se calcula
 ni un euro. El Panel no escribe en la base de datos: la foto del día y los incumplimientos se
@@ -86,7 +87,7 @@ from sharky.services.settings import Settings
 from sharky.ui import theme as theme_module
 from sharky.ui.pages import card, muted, restyle, set_state, state_label
 from sharky.ui.portfolio import PriceRefresher, RefreshOutcome, RefreshProgress
-from sharky.ui.reports import DailyCard, ReportRunner
+from sharky.ui.reports import DailyCard, MonthlyCard, ReportCard, ReportRunner, WeeklyCard
 from sharky.ui.theme import ThemeController
 
 log = logging.getLogger(__name__)
@@ -462,8 +463,10 @@ class PanelPage(QWidget):
         self._theme = theme
         self._refresher = refresher
         self._runner = runner
-        #: La tarjeta «Control diario» (sin `runner`, «Próximamente»).
+        #: Las tarjetas de los tres informes (sin `runner`, «Próximamente»).
         self.daily_card: DailyCard | None = None
+        self.weekly_card: WeeklyCard | None = None
+        self.monthly_card: MonthlyCard | None = None
         self._settings = settings or Settings()
         self._now = now
         self.data: PanelData | None = None
@@ -516,21 +519,23 @@ class PanelPage(QWidget):
         derecha.setSpacing(16)
         if runner is not None:
             self.daily_card = DailyCard(db, runner, now=now)
-            derecha.addWidget(self.daily_card)
+            self.weekly_card = WeeklyCard(db, runner, now=now)
+            self.monthly_card = MonthlyCard(db, runner, now=now)
+            for tarjeta in self.report_cards:
+                derecha.addWidget(tarjeta)
         else:
-            derecha.addWidget(coming_soon(
-                "Control diario", "El control del día con Claude: su conclusión, «Leer» y "
-                "«Ejecutar ahora» con su precio aproximado."
-            ))
-        for titulo, texto in (
-            ("Noticias semanales", "El escaneo de noticias de cada posición, con sus fuentes. "
-             "Llega en el hito H10."),
-            ("Estudio mensual", "El estudio del mes con un veredicto por posición. Llega en el "
-             "hito H10."),
-            ("Oportunidades en radar", "Las alertas activas del radar y el acceso a la pantalla "
-             "Radar. Llega en el hito H11."),
-        ):
-            derecha.addWidget(coming_soon(titulo, texto))
+            for titulo, texto in (
+                ("Control diario", "El control del día con Claude: su conclusión, «Leer» y "
+                 "«Ejecutar ahora» con su precio aproximado."),
+                ("Noticias semanales", "El escaneo de noticias de cada posición, con sus "
+                 "fuentes."),
+                ("Estudio mensual", "El estudio del mes con un veredicto por posición."),
+            ):
+                derecha.addWidget(coming_soon(titulo, texto))
+        derecha.addWidget(coming_soon(
+            "Oportunidades en radar", "Las alertas activas del radar y el acceso a la pantalla "
+            "Radar. Llega en el hito H11."
+        ))
         derecha.addStretch(1)
         abajo.addLayout(derecha, 2)
         caja.addLayout(abajo)
@@ -636,14 +641,19 @@ class PanelPage(QWidget):
     def refreshing(self) -> bool:
         return self._refresher.running
 
+    @property
+    def report_cards(self) -> list[ReportCard]:
+        """Las tarjetas de los informes que hay (ninguna sin `runner`)."""
+        return [t for t in (self.daily_card, self.weekly_card, self.monthly_card) if t]
+
     def reload(self) -> None:
         """Vuelve a calcular el Panel con lo guardado (sin descargar nada)."""
         conn = self._db.connection()
         ahora = self._now()
         valoracion = load_valuation(conn, ahora, self._refresher.market_at)
         self._show(valoracion, ahora)
-        if self.daily_card is not None:
-            self.daily_card.refresh()
+        for tarjeta in self.report_cards:
+            tarjeta.refresh()
 
     def _show(self, valuation: Valuation, now: datetime) -> None:
         datos = panel_data(

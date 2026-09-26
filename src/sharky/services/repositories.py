@@ -527,6 +527,20 @@ class ReportRepository(_Repository):
     def list_all(self) -> list[Report]:
         return self._select(order="created_at DESC, id DESC")
 
+    def for_period(self, kind: ReportKind, period: str) -> Report | None:
+        """El diario, semanal o mensual de ese periodo («2026-09-25», «2026-08»)."""
+        return self._one("kind = ? AND period = ?", (kind.value, period))
+
+    def list_kind(self, kind: ReportKind) -> list[Report]:
+        """Los informes de un tipo, por periodo (del más antiguo al más reciente)."""
+        return self._select("kind = ?", (kind.value,), order="period, created_at, id")
+
+    def list_between(self, kind: ReportKind, first: str, last: str) -> list[Report]:
+        """Los informes de un tipo con el periodo entre `first` y `last` (incluidos), por
+        periodo. Vale con los periodos que son fechas ISO: se ordenan como texto."""
+        return self._select("kind = ? AND period >= ? AND period <= ?",
+                            (kind.value, first, last), order="period, created_at, id")
+
 
 class PortfolioExistsError(RuntimeError):
     """Ya hay una cartera: el asistente de primer arranque no escribe encima."""

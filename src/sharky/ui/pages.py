@@ -2,7 +2,7 @@
 
 Las que todavía no tienen su hito están vacías a propósito: cada una dice qué vivirá en ella y
 en qué hito llega. Ya funcionan Panel (H6, en ui/panel.py), Cartera (H5, en ui/portfolio.py),
-Operar (H8, en ui/trade.py), Tesis (H7, en ui/theses.py), Informes (H9, en ui/reports.py) y
+Operar (H8, en ui/trade.py), Tesis (H7, en ui/theses.py), Informes (H9 y H10, en ui/reports.py) y
 Ajustes, con Claude (H9, en ui/settings.py), Apariencia (el tema), Datos (copia de seguridad y
 restauración, H3) y Acerca de (la versión).
 """

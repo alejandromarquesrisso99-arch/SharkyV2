@@ -1,16 +1,18 @@
-"""Informes (GUIA §5.10, punto 6, y §7, H9): la pantalla, la tarjeta «Control diario» del Panel
-y el lanzador que comparten.
+"""Informes (GUIA §5.10, punto 6, y §7, H9 y H10): la pantalla, las tarjetas de los tres informes
+del Panel y el lanzador que comparten.
 
 - **Pantalla Informes** (docs/maqueta/06-informes.png): filtros por tipo, la lista por fecha
   con el coste de cada informe o la marca «Sin IA», y el lector Markdown (QTextBrowser) con el
-  modelo, el esfuerzo y el coste. «Exportar .md».
-- **Tarjeta «Control diario»** del Panel: su estado, la fecha, la conclusión, «Leer» y
-  «Ejecutar ahora» con el precio aproximado al lado. El diálogo de confirmación lo repite junto
-  a lo que va a hacer y al gasto del mes; al terminar se enseña el coste real.
+  modelo, el esfuerzo y el coste. «Exportar .md». Los enlaces de «Fuentes» se abren fuera.
+- **Tarjetas «Control diario», «Noticias semanales» y «Estudio mensual»** del Panel: su estado
+  (qué toca, según core/schedule.py), la fecha, la conclusión, «Leer» y «Ejecutar ahora» con el
+  precio aproximado al lado. El diálogo de confirmación lo repite junto a lo que va a hacer y al
+  gasto del mes; el del mensual deja elegir el mes anterior o el mes en curso (parcial). Al
+  terminar se enseña el coste real.
 - **ReportRunner**: primero actualiza los precios con la descarga de siempre (gratis; el aviso
-  de un stop sale en ese momento) y después, en un hilo de trabajo, el control diario con
-  Claude (services/reports.py). No hay «Cancelar» mientras escribe Claude: es una llamada corta
-  y ya pagada. Al cerrar la app se corta y no se guarda nada.
+  de un stop sale en ese momento) y después, en un hilo de trabajo, el informe con Claude
+  (services/reports.py). Uno a la vez. No hay «Cancelar» mientras escribe Claude: al cerrar la
+  app se corta y no se guarda nada.
 """
 
 from __future__ import annotations
@@ -19,12 +21,13 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QStandardPaths, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -33,6 +36,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
@@ -40,7 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sharky.core.formatting import format_usd, month_name
+from sharky.core.formatting import format_usd, month_name, weekday_name
 from sharky.core.models import Report, ReportKind
 from sharky.core.reports import (
     ACTION_LABELS,
@@ -49,18 +53,26 @@ from sharky.core.reports import (
     BudgetCheck,
     usage_text,
 )
+from sharky.core.schedule import Month, parse_day, weekly_rule_text, weekly_window
 from sharky.services import secrets
 from sharky.services.ai import ClaudeClient
 from sharky.services.db import Database
 from sharky.services.market import load_valuation, local_now
 from sharky.services.reports import (
     TRIGGER_MANUAL,
-    DailyOutcome,
+    ReportOutcome,
+    ReportSchedule,
     budget_check,
     create_daily_report,
+    create_monthly_report,
+    create_weekly_report,
     daily_for,
+    is_partial_study,
     latest_report,
+    monthly_for,
     price_for,
+    report_schedule,
+    weekly_for,
 )
 from sharky.services.repositories import ReportRepository
 from sharky.services.settings import Settings
@@ -79,6 +91,13 @@ KIND_TITLES: dict[ReportKind, str] = {
     ReportKind.EXPLORATION: "Exploración de mercado",
 }
 
+#: El tipo de informe de cada acción.
+ACTION_KINDS: dict[AIAction, ReportKind] = {
+    AIAction.DAILY: ReportKind.DAILY,
+    AIAction.WEEKLY: ReportKind.WEEKLY,
+    AIAction.MONTHLY: ReportKind.MONTHLY,
+}
+
 #: Los filtros de la lista: texto y tipo (None = todos).
 FILTERS: tuple[tuple[str, ReportKind | None], ...] = (
     ("Todos", None),
@@ -92,14 +111,21 @@ LIST_WIDTH = 250
 
 
 def report_title(report: Report) -> str:
-    """«Control diario», «Estudio mensual — agosto»…"""
+    """«Control diario», «Noticias semanales — del 21/09 al 27/09», «Estudio mensual — agosto
+    2026» (con «(parcial)» si se hizo antes de que acabara el mes)…"""
     titulo = KIND_TITLES[report.kind]
     if report.kind is ReportKind.MONTHLY:
-        try:
-            anio, mes = (int(x) for x in report.period.split("-")[:2])
-        except ValueError:
+        mes = Month.parse(report.period)
+        if mes is None:
             return titulo
-        return f"{titulo} — {month_name(mes)} {anio}"
+        texto = f"{titulo} — {month_name(mes.month)} {mes.year}"
+        return f"{texto} (parcial)" if is_partial_study(report) else texto
+    if report.kind is ReportKind.WEEKLY:
+        hasta = parse_day(report.period)
+        if hasta is None:
+            return titulo
+        desde, _ = weekly_window(hasta)
+        return f"{titulo} — del {desde:%d/%m} al {hasta:%d/%m}"
     return titulo
 
 
@@ -171,6 +197,21 @@ def _chip(texto: str, estilo: str) -> tuple[QFrame, QLabel]:
 
 
 @dataclass(frozen=True)
+class MonthOption:
+    """Un mes que se puede estudiar con «Ejecutar ahora»."""
+
+    month: Month
+    partial: bool  # el mes en curso: hasta hoy
+    existing: Report | None  # el estudio de ese mes que se sustituiría
+
+    @property
+    def label(self) -> str:
+        if self.partial:
+            return f"Mes en curso (parcial): {self.month.label}, hasta hoy"
+        return f"Mes anterior: {self.month.label}"
+
+
+@dataclass(frozen=True)
 class RunPlan:
     """Lo que se enseña antes de lanzar una acción: con qué, cuánto costaría y si cabe."""
 
@@ -181,7 +222,10 @@ class RunPlan:
     priced: bool
     budget: BudgetCheck
     existing: Report | None
-    month: int
+    month: int  # el mes del gasto
+    #: Mensual: los meses que se pueden estudiar y el que se propone.
+    month_options: tuple[MonthOption, ...] = ()
+    study: Month | None = None
 
     @property
     def uses_ai(self) -> bool:
@@ -208,6 +252,34 @@ class RunPlan:
     def spent_text(self) -> str:
         return f"Gasto de {month_name(self.month)}: {self.budget.spent_text}."
 
+    def option(self, month: Month | None) -> MonthOption | None:
+        return next((o for o in self.month_options if o.month == month), None)
+
+
+def run_report_job(
+    action: AIAction,
+    month: Month | None,
+    db: Database,
+    settings: Settings,
+    now: Callable[[], datetime],
+    market_at: datetime | None,
+    key_loader: Callable[[], str | None],
+    client_factory: Callable[[str], ClaudeClient],
+    cancel: threading.Event,
+    progress: Callable[[int, int], None] | None = None,
+) -> ReportOutcome:
+    """Un informe en un hilo de trabajo, con los precios que acaban de guardarse."""
+    valoracion = load_valuation(db.connection(), now(), market_at)
+    comun = {"trigger": TRIGGER_MANUAL, "cancel": cancel, "client_factory": client_factory}
+    if action is AIAction.WEEKLY:
+        return create_weekly_report(db, valoracion, settings, now, key_loader(), **comun)
+    if action is AIAction.MONTHLY:
+        if month is None:
+            raise ValueError("Falta el mes del estudio")
+        return create_monthly_report(db, valoracion, settings, now, key_loader(), month,
+                                     on_stage=progress, **comun)
+    return create_daily_report(db, valoracion, settings, now, key_loader(), **comun)
+
 
 def run_daily_job(
     db: Database,
@@ -217,23 +289,29 @@ def run_daily_job(
     key_loader: Callable[[], str | None],
     client_factory: Callable[[str], ClaudeClient],
     cancel: threading.Event,
-) -> DailyOutcome:
-    """El control diario en un hilo de trabajo, con los precios que acaban de guardarse."""
-    valoracion = load_valuation(db.connection(), now(), market_at)
-    return create_daily_report(
-        db, valoracion, settings, now, key_loader(),
-        trigger=TRIGGER_MANUAL, cancel=cancel, client_factory=client_factory,
-    )
+) -> ReportOutcome:
+    """El control diario en un hilo de trabajo (el nombre del H9)."""
+    return run_report_job(AIAction.DAILY, None, db, settings, now, market_at, key_loader,
+                          client_factory, cancel)
+
+
+#: Lo que se enseña mientras Claude trabaja.
+STAGE_TEXTS: dict[AIAction, str] = {
+    AIAction.DAILY: "Claude está escribiendo el control diario…",
+    AIAction.WEEKLY: "Claude está buscando noticias en la web…",
+    AIAction.MONTHLY: "Claude está escribiendo el estudio (paso 1 de 2)…",
+}
+EXTRACTION_STAGE = "Claude está extrayendo los veredictos (paso 2 de 2)…"
 
 
 class ReportRunner(QObject):
-    """«Ejecutar ahora» del control diario: precios primero (gratis) y luego Claude, en
-    segundo plano. Una sola ejecución a la vez. Las señales llegan al hilo de la interfaz."""
+    """«Ejecutar ahora» de los informes: precios primero (gratis) y luego Claude, en segundo
+    plano. Una sola ejecución a la vez. Las señales llegan al hilo de la interfaz."""
 
     started = Signal()
     #: Lo que se está haciendo ahora, para enseñarlo junto a la barra.
     stageChanged = Signal(str)
-    #: Ha terminado, con su DailyOutcome.
+    #: Ha terminado, con su ReportOutcome.
     finished = Signal(object)
     failed = Signal(str)
     #: Ha terminado, bien o mal (después de `finished` o `failed`).
@@ -260,32 +338,71 @@ class ReportRunner(QObject):
         self._waiting_prices = False
         self._worker: Worker | None = None
         self._cancel: threading.Event | None = None
+        #: La acción en marcha (None si no hay ninguna) y, en el mensual, su mes.
+        self.action: AIAction | None = None
+        self.month: Month | None = None
         refresher.stopped.connect(self._on_prices_done)
 
     @property
     def running(self) -> bool:
         return self._waiting_prices or self._worker is not None
 
-    def plan_daily(self) -> RunPlan:
-        """Con qué modelo iría, cuánto costaría y si cabe en el tope. Solo lee."""
+    def schedule(self) -> ReportSchedule:
+        """Qué toca hoy. Solo lee."""
+        return report_schedule(self._db.connection(), self.settings, self._now().date())
+
+    def plan(self, action: AIAction) -> RunPlan:
+        """Con qué modelo iría, cuánto costaría, si cabe en el tope y qué sustituiría. Solo
+        lee."""
         conn = self._db.connection()
         ahora = self._now()
         ai = self.settings.ai
+        ajuste = getattr(ai, action.value)
+        opciones: tuple[MonthOption, ...] = ()
+        estudio: Month | None = None
+        if action is AIAction.MONTHLY:
+            agenda = report_schedule(conn, self.settings, ahora.date())
+            meses = [(agenda.previous_month, False), (agenda.current_month, True)]
+            opciones = tuple(MonthOption(m, parcial, monthly_for(conn, m))
+                             for m, parcial in meses if m is not None)
+            # Se propone el que toca; si no toca ninguno, el anterior si aún no tiene estudio
+            # (el primer mes incompleto, a mano) y, si no, el mes en curso.
+            anterior = opciones[0] if opciones and not opciones[0].partial else None
+            if agenda.monthly_due is not None:
+                estudio = agenda.monthly_due
+            elif anterior is not None and anterior.existing is None:
+                estudio = anterior.month
+            else:
+                estudio = agenda.current_month
+            existente = monthly_for(conn, estudio)
+        elif action is AIAction.WEEKLY:
+            existente = weekly_for(conn, ahora.date())
+        else:
+            existente = daily_for(conn, ahora.date())
         return RunPlan(
-            AIAction.DAILY,
-            ai.daily.model,
-            ai.daily.effort,
+            action,
+            ajuste.model,
+            ajuste.effort,
             self._key_loader() is not None,
-            price_for(ai, ai.daily.model) is not None,
-            budget_check(conn, ai, AIAction.DAILY, ahora),
-            daily_for(conn, ahora.date()),
+            price_for(ai, ajuste.model) is not None,
+            budget_check(conn, ai, action, ahora),
+            existente,
             ahora.month,
+            opciones,
+            estudio,
         )
 
-    def start_daily(self) -> bool:
-        """Empieza: precios y después el control diario. False si ya estaba en marcha."""
+    def plan_daily(self) -> RunPlan:
+        return self.plan(AIAction.DAILY)
+
+    def start(self, action: AIAction, month: Month | None = None) -> bool:
+        """Empieza: precios y después el informe. False si ya había uno en marcha."""
         if self.running:
             return False
+        if action is AIAction.MONTHLY and month is None:
+            raise ValueError("El estudio mensual necesita su mes")
+        self.action = action
+        self.month = month
         self._cancel = threading.Event()
         self.started.emit()
         self.stageChanged.emit("Actualizando precios (gratis)…")
@@ -294,6 +411,9 @@ class ReportRunner(QObject):
             self._waiting_prices = False
             self._start_report()
         return True
+
+    def start_daily(self) -> bool:
+        return self.start(AIAction.DAILY)
 
     def _on_prices_done(self) -> None:
         if not self._waiting_prices:
@@ -306,9 +426,12 @@ class ReportRunner(QObject):
         self._start_report()
 
     def _start_report(self) -> None:
-        self.stageChanged.emit("Claude está escribiendo el control diario…")
+        accion = self.action or AIAction.DAILY
+        self.stageChanged.emit(STAGE_TEXTS[accion])
         trabajo = Worker(
-            run_daily_job,
+            run_report_job,
+            accion,
+            self.month,
             self._db,
             self.settings,
             self._now,
@@ -317,12 +440,19 @@ class ReportRunner(QObject):
             self._client_factory,
             self._cancel or threading.Event(),
         )
+        if accion is AIAction.MONTHLY:
+            trabajo.pass_progress()
+            trabajo.signals.progress.connect(self._on_progress)
         trabajo.signals.finished.connect(self._on_done)
         trabajo.signals.failed.connect(self._on_failed)
         self._worker = trabajo  # sin referencia, las señales se perderían
         start(trabajo)
 
-    def _on_done(self, outcome: DailyOutcome) -> None:
+    def _on_progress(self, step: int, _steps: int) -> None:
+        if step >= 2:
+            self.stageChanged.emit(EXTRACTION_STAGE)
+
+    def _on_done(self, outcome: ReportOutcome) -> None:
         self._worker = None
         self.finished.emit(outcome)
         self._finish()
@@ -335,6 +465,8 @@ class ReportRunner(QObject):
 
     def _finish(self) -> None:
         self._cancel = None
+        self.action = None
+        self.month = None
         self.stopped.emit()
 
     def shutdown(self) -> None:
@@ -343,7 +475,7 @@ class ReportRunner(QObject):
             self._cancel.set()
 
 
-# -- la tarjeta del Panel ---------------------------------------------------------------------
+# -- las tarjetas del Panel -------------------------------------------------------------------
 
 
 def _day(moment: datetime, today: date) -> str:
@@ -352,8 +484,36 @@ def _day(moment: datetime, today: date) -> str:
     return f"{moment:%d/%m/%Y, %H:%M}"
 
 
-class DailyCard(QFrame):
-    """La tarjeta «Control diario» del Panel."""
+def _short_day(day: date, today: date) -> str:
+    """«hoy», «mañana» o «domingo 04/10»."""
+    if day == today:
+        return "hoy"
+    if day == today + timedelta(days=1):
+        return "mañana"
+    return f"{weekday_name(day.weekday())} {day:%d/%m}"
+
+
+@dataclass(frozen=True)
+class CardState:
+    """Lo que enseña una tarjeta: el informe que se lee y la etiqueta de estado."""
+
+    report: Report | None  # el que se lee con «Leer»
+    current: bool  # es el del periodo de ahora (si no, «Último: …»)
+    chip: str
+    chip_style: str
+
+
+class ReportCard(QFrame):
+    """Una tarjeta de informe del Panel. Cada tipo dice qué toca y qué enseñar."""
+
+    action: AIAction = AIAction.DAILY
+    #: Lo que dice la tarjeta si todavía no hay ningún informe de su tipo.
+    empty_when = ""
+    empty_text = ""
+    #: La ayuda de «Ejecutar ahora».
+    run_help = ""
+    saved_text = ""
+    failed_text = ""
 
     #: «Leer»: el id del informe.
     readRequested = Signal(int)
@@ -379,7 +539,7 @@ class DailyCard(QFrame):
         caja.setSpacing(8)
         fila = QHBoxLayout()
         fila.setSpacing(10)
-        titulo = QLabel(ACTION_LABELS[AIAction.DAILY])
+        titulo = QLabel(ACTION_LABELS[self.action])
         titulo.setObjectName("cardTitle")
         fila.addWidget(titulo)
         self.chip, self.chip_label = _chip("Pendiente", "chipMuted")
@@ -427,7 +587,7 @@ class DailyCard(QFrame):
         caja.addLayout(botones)
 
         runner.started.connect(self._on_started)
-        runner.stageChanged.connect(self.stage_label.setText)
+        runner.stageChanged.connect(self._on_stage)
         runner.finished.connect(self._on_finished)
         runner.failed.connect(self._on_failed)
         runner.stopped.connect(self.refresh)
@@ -435,51 +595,49 @@ class DailyCard(QFrame):
 
     # -- estado ------------------------------------------------------------------------
 
-    def refresh(self) -> None:
-        """Pone al día la tarjeta con lo guardado y el precio del botón."""
-        conn = self._db.connection()
-        ahora = self._now()
-        hoy = ahora.date()
-        de_hoy = daily_for(conn, hoy)
-        ultimo = de_hoy or latest_report(conn, ReportKind.DAILY)
-        self.report = ultimo
-        self.plan = self._runner.plan_daily()
+    @property
+    def mine(self) -> bool:
+        """La ejecución en marcha es de esta tarjeta."""
+        return self._runner.action is self.action
 
-        en_marcha = self._runner.running
-        if en_marcha:
-            texto, estilo = "En marcha", "chipMuted"
-        elif de_hoy is None:
-            texto, estilo = "Pendiente", "chipMuted"
-        elif de_hoy.used_ai:
-            texto, estilo = "Hecho hoy", "chipOk"
-        else:
-            texto, estilo = "Sin IA", "chipWarn"
+    def state(self, schedule: ReportSchedule) -> CardState:  # pragma: no cover
+        raise NotImplementedError
+
+    def refresh(self) -> None:
+        """Pone al día la tarjeta con lo guardado, lo que toca y el precio del botón."""
+        hoy = self._now().date()
+        agenda = self._runner.schedule()
+        estado = self.state(agenda)
+        self.report = estado.report
+        self.plan = self._runner.plan(self.action)
+
+        en_marcha = self._runner.running and self.mine
+        texto, estilo = ("En marcha", "chipMuted") if en_marcha else (estado.chip,
+                                                                     estado.chip_style)
         self.chip_label.setText(texto)
         restyle(self.chip, estilo)
 
-        if ultimo is None:
-            self.when_label.setText("Todavía no hay ningún control diario.")
+        informe = estado.report
+        if informe is None:
+            self.when_label.setText(self.empty_when)
             self.when_label.setToolTip("")
-            self.conclusion_label.setText(
-                "El control del día con Claude: estado, niveles e incumplimientos, y una "
-                "conclusión corta que releerán el semanal y el mensual."
-            )
+            self.conclusion_label.setText(self.empty_text)
             restyle(self.conclusion_label, "muted")
         else:
-            prefijo = "" if de_hoy is not None else "Último: "
-            self.when_label.setText(f"{prefijo}{_day(ultimo.created_at, hoy)} · "
-                                    f"{report_meta(ultimo)}")
-            self.when_label.setToolTip(report_details(ultimo))
-            self.conclusion_label.setText(conclusion_lines(ultimo.conclusion))
+            prefijo = "" if estado.current else "Último: "
+            self.when_label.setText(f"{prefijo}{self._when(informe, hoy)} · "
+                                    f"{report_meta(informe)}")
+            self.when_label.setToolTip(report_details(informe))
+            self.conclusion_label.setText(conclusion_lines(informe.conclusion))
             restyle(self.conclusion_label, "conclusion")
-        self.read_button.setEnabled(ultimo is not None and ultimo.id is not None)
+        self.read_button.setEnabled(informe is not None and informe.id is not None)
         self.run_button.setText(f"Ejecutar ahora · {self.plan.price_text}")
-        self.run_button.setToolTip(
-            "Actualiza los precios (gratis) y pide a Claude el control del día. "
-            f"{self.plan.spent_text}"
-        )
-        self.run_button.setEnabled(not en_marcha)
+        self.run_button.setToolTip(f"{self.run_help} {self.plan.spent_text}")
+        self.run_button.setEnabled(not self._runner.running)
         self.progress.setVisible(en_marcha)
+
+    def _when(self, report: Report, today: date) -> str:
+        return _day(report.created_at, today)
 
     # -- acciones ----------------------------------------------------------------------
 
@@ -488,26 +646,35 @@ class DailyCard(QFrame):
             self.readRequested.emit(self.report.id)
 
     def run_now(self) -> None:
-        plan = self._runner.plan_daily()
-        if not self.confirm_run(plan):
+        plan = self._runner.plan(self.action)
+        respuesta = self.confirm_run(plan)
+        if not respuesta:
             return
+        mes = respuesta if isinstance(respuesta, Month) else plan.study
         set_state(self.message_label, "", "muted")
-        self._runner.start_daily()
+        self._runner.start(self.action, mes)
 
     def _on_started(self) -> None:
         self.run_button.setEnabled(False)
+        if not self.mine:
+            return
         self.progress.setVisible(True)
         self.chip_label.setText("En marcha")
         restyle(self.chip, "chipMuted")
         set_state(self.message_label, "", "muted")
 
-    def _on_finished(self, outcome: DailyOutcome) -> None:
+    def _on_stage(self, text: str) -> None:
+        if self.mine:
+            self.stage_label.setText(text)
+
+    def _on_finished(self, outcome: ReportOutcome) -> None:
         informe = outcome.report
+        if informe.kind is not ACTION_KINDS[self.action]:
+            return
         if informe.used_ai:
-            texto = (
-                f"Control diario guardado. Coste real: {format_usd(informe.cost_usd)} "
-                f"({usage_text(informe.input_tokens, informe.output_tokens)})."
-            )
+            uso = usage_text(informe.input_tokens, informe.output_tokens, informe.web_searches)
+            texto = f"{self.saved_text} Coste real: {format_usd(informe.cost_usd)} ({uso})."
+            texto += self.extra_message(outcome)
             set_state(self.message_label, texto, "okText")
         else:
             texto = f"Guardado sin análisis de IA: {informe.error}"
@@ -515,44 +682,251 @@ class DailyCard(QFrame):
                 texto += f" Coste real de los intentos: {format_usd(informe.cost_usd)}."
             set_state(self.message_label, texto, "warnText")
 
+    def extra_message(self, outcome: ReportOutcome) -> str:
+        return ""
+
     def _on_failed(self, message: str) -> None:
-        set_state(self.message_label, f"No se ha podido hacer el control diario: {message}",
-                  "dangerText")
+        if self.mine:
+            set_state(self.message_label, f"No se ha podido hacer {self.failed_text}: {message}",
+                      "dangerText")
 
     # -- diálogo (los tests lo sustituyen) -----------------------------------------------
 
-    def confirm_run(self, plan: RunPlan) -> bool:
+    def confirm_run(self, plan: RunPlan) -> bool | Month:
+        """True para lanzar (en el mensual, o el mes elegido); False para no hacer nada."""
         caja = QMessageBox(self)
         caja.setIcon(QMessageBox.Icon.Question)
-        caja.setWindowTitle(ACTION_LABELS[AIAction.DAILY])
-        lineas = []
-        if plan.uses_ai:
-            caja.setText("¿Hacer ahora el control diario con Claude?")
-            lineas.append(
-                "Primero se actualizan los precios (gratis). Después Claude "
-                f"({plan.model}, esfuerzo {plan.effort}) escribe el análisis del día con las "
-                "cifras que calcula Sharky."
-            )
-            lineas.append(f"Coste aproximado: {plan.budget.estimate.text}.")
-            boton = f"Ejecutar ({plan.budget.estimate.text})"
-        else:
-            caja.setText("El control diario saldrá sin análisis de IA.")
-            lineas.append(
-                f"Motivo: {plan.no_ai_reason}. Se actualizan los precios y se guarda la parte "
-                f"que calcula Sharky, con la etiqueta «{NO_AI_LABEL}». Gratis."
-            )
-            boton = "Generar sin IA (gratis)"
-        lineas.append(plan.spent_text)
-        if plan.existing is not None:
-            lineas.append(
-                f"Ya hay un control de hoy ({plan.existing.created_at:%H:%M}): se sustituirá."
-            )
-        caja.setInformativeText("\n\n".join(lineas))
-        ejecutar = caja.addButton(boton, QMessageBox.ButtonRole.AcceptRole)
+        caja.setWindowTitle(ACTION_LABELS[self.action])
+        caja.setText(plan_question(plan))
+        caja.setInformativeText("\n\n".join(plan_lines(plan, plan.existing)))
+        ejecutar = caja.addButton(plan_button(plan), QMessageBox.ButtonRole.AcceptRole)
         cancelar = caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
         caja.setDefaultButton(cancelar)
         caja.exec()
         return caja.clickedButton() is ejecutar
+
+
+#: Qué hace cada acción, para el diálogo de confirmación.
+_WHAT: dict[AIAction, str] = {
+    AIAction.DAILY: "escribe el análisis del día con las cifras que calcula Sharky.",
+    AIAction.WEEKLY: "busca en la web las noticias de la semana de cada posición y cita sus "
+                     "fuentes.",
+    AIAction.MONTHLY: "escribe el estudio del mes y después se extrae un veredicto por "
+                      "posición. Las revisiones y propuestas van a Tesis: no cambia ningún "
+                      "número.",
+}
+_QUESTIONS: dict[AIAction, str] = {
+    AIAction.DAILY: "¿Hacer ahora el control diario con Claude?",
+    AIAction.WEEKLY: "¿Hacer ahora el semanal de noticias con Claude?",
+    AIAction.MONTHLY: "¿Hacer ahora el estudio mensual con Claude?",
+}
+_NO_AI_QUESTIONS: dict[AIAction, str] = {
+    AIAction.DAILY: "El control diario saldrá sin análisis de IA.",
+    AIAction.WEEKLY: "El semanal saldrá sin análisis de IA.",
+    AIAction.MONTHLY: "El estudio mensual saldrá sin análisis de IA.",
+}
+_EXISTING: dict[AIAction, str] = {
+    AIAction.DAILY: "Ya hay un control de hoy",
+    AIAction.WEEKLY: "Ya hay un semanal de hoy",
+    AIAction.MONTHLY: "Ya hay un estudio de ese mes",
+}
+
+
+def plan_question(plan: RunPlan) -> str:
+    return _QUESTIONS[plan.action] if plan.uses_ai else _NO_AI_QUESTIONS[plan.action]
+
+
+def plan_button(plan: RunPlan) -> str:
+    return f"Ejecutar ({plan.budget.estimate.text})" if plan.uses_ai else "Generar sin IA (gratis)"
+
+
+def plan_lines(plan: RunPlan, existing: Report | None) -> list[str]:
+    """El texto del diálogo de confirmación: qué hará, cuánto cuesta, el gasto del mes y si
+    sustituye un informe que ya existe."""
+    lineas = []
+    if plan.uses_ai:
+        lineas.append(
+            f"Primero se actualizan los precios (gratis). Después Claude ({plan.model}, esfuerzo "
+            f"{plan.effort}) {_WHAT[plan.action]}"
+        )
+        lineas.append(f"Coste aproximado: {plan.budget.estimate.text}.")
+    else:
+        lineas.append(
+            f"Motivo: {plan.no_ai_reason}. Se actualizan los precios y se guarda la parte que "
+            f"calcula Sharky, con la etiqueta «{NO_AI_LABEL}». Gratis."
+        )
+    lineas.append(plan.spent_text)
+    if existing is not None:
+        if plan.action is AIAction.MONTHLY:
+            lineas.append(f"{_EXISTING[plan.action]} (hecho el {existing.created_at:%d/%m/%Y}): "
+                          "se sustituirá.")
+        else:
+            lineas.append(f"{_EXISTING[plan.action]} ({existing.created_at:%H:%M}): se "
+                          "sustituirá.")
+    return lineas
+
+
+class DailyCard(ReportCard):
+    """La tarjeta «Control diario» del Panel."""
+
+    action = AIAction.DAILY
+    empty_when = "Todavía no hay ningún control diario."
+    empty_text = (
+        "El control del día con Claude: estado, niveles e incumplimientos, y una conclusión "
+        "corta que releerán el semanal y el mensual."
+    )
+    run_help = "Actualiza los precios (gratis) y pide a Claude el control del día."
+    saved_text = "Control diario guardado."
+    failed_text = "el control diario"
+
+    def state(self, schedule: ReportSchedule) -> CardState:
+        de_hoy = daily_for(self._db.connection(), schedule.today)
+        ultimo = de_hoy or latest_report(self._db.connection(), ReportKind.DAILY)
+        if de_hoy is None:
+            return CardState(ultimo, False, "Pendiente", "chipMuted")
+        if de_hoy.used_ai:
+            return CardState(de_hoy, True, "Hecho hoy", "chipOk")
+        return CardState(de_hoy, True, "Sin IA", "chipWarn")
+
+
+class WeeklyCard(ReportCard):
+    """La tarjeta «Noticias semanales» del Panel."""
+
+    action = AIAction.WEEKLY
+    empty_when = "Todavía no hay ningún semanal."
+    empty_text = (
+        "Las noticias de la semana de cada posición, buscadas en la web con sus fuentes, y una "
+        "conclusión que releerá el estudio mensual."
+    )
+    run_help = ("Actualiza los precios (gratis) y pide a Claude las noticias de la semana, con "
+                "búsqueda web.")
+    saved_text = "Semanal guardado."
+    failed_text = "el semanal"
+
+    def state(self, schedule: ReportSchedule) -> CardState:
+        de_hoy = weekly_for(self._db.connection(), schedule.today)
+        ultimo = de_hoy or latest_report(self._db.connection(), ReportKind.WEEKLY)
+        self.setToolTip(f"Toca {weekly_rule_text(schedule.weekday)}.")
+        if de_hoy is not None:
+            if de_hoy.used_ai:
+                return CardState(de_hoy, True, "Hecho hoy", "chipOk")
+            return CardState(de_hoy, True, "Sin IA", "chipWarn")
+        if schedule.weekly_due:
+            return CardState(ultimo, False, "Toca hoy", "chipWarn")
+        if schedule.next_weekly is not None:
+            cuando = _short_day(schedule.next_weekly, schedule.today)
+            return CardState(ultimo, False, f"Próximo: {cuando}", "chipMuted")
+        return CardState(ultimo, False, "Pendiente", "chipMuted")
+
+class MonthlyCard(ReportCard):
+    """La tarjeta «Estudio mensual» del Panel."""
+
+    action = AIAction.MONTHLY
+    empty_when = "Todavía no hay ningún estudio mensual."
+    empty_text = (
+        "El estudio del mes con un veredicto por posición; sus propuestas llegan a Tesis para "
+        "que decidas tú."
+    )
+    run_help = ("Actualiza los precios (gratis) y pide a Claude el estudio del mes y un "
+                "veredicto por posición.")
+    saved_text = "Estudio mensual guardado."
+    failed_text = "el estudio mensual"
+
+    def state(self, schedule: ReportSchedule) -> CardState:
+        db = self._db.connection()
+        ultimo = latest_report(db, ReportKind.MONTHLY)
+        anterior = schedule.previous_month
+        if schedule.monthly_due is not None:
+            return CardState(ultimo, False, f"Toca: {month_name(schedule.monthly_due.month)}",
+                             "chipWarn")
+        del_anterior = monthly_for(db, anterior) if anterior is not None else None
+        if del_anterior is not None and not is_partial_study(del_anterior):
+            nombre = month_name(anterior.month)
+            if del_anterior.used_ai:
+                return CardState(del_anterior, True, f"Hecho: {nombre}", "chipOk")
+            return CardState(del_anterior, True, "Sin IA", "chipWarn")
+        if schedule.next_monthly is not None:
+            return CardState(ultimo, False,
+                             f"Próximo: {_short_day(schedule.next_monthly, schedule.today)}",
+                             "chipMuted")
+        return CardState(ultimo, False, "Pendiente", "chipMuted")
+
+    def _when(self, report: Report, today: date) -> str:
+        mes = report_title(report).removeprefix(f"{KIND_TITLES[ReportKind.MONTHLY]} — ")
+        return f"{mes}, {_day(report.created_at, today)}"
+
+    def extra_message(self, outcome: ReportOutcome) -> str:
+        if outcome.verdicts_unavailable:
+            return f" Veredictos no disponibles: {outcome.verdicts_unavailable}"
+        if outcome.thesis_events:
+            return f" Añadidos a Tesis: {len(outcome.thesis_events)} revisiones y propuestas."
+        return ""
+
+    def confirm_run(self, plan: RunPlan) -> bool | Month:
+        dialogo = MonthlyRunDialog(plan, self)
+        if dialogo.exec() != QDialog.DialogCode.Accepted:
+            return False
+        return dialogo.chosen
+
+
+class MonthlyRunDialog(QDialog):
+    """La confirmación del estudio mensual: el mes (el anterior o el en curso, parcial), lo que
+    hará, lo que cuesta y si sustituye un estudio que ya existe."""
+
+    def __init__(self, plan: RunPlan, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.plan = plan
+        self.setWindowTitle(ACTION_LABELS[AIAction.MONTHLY])
+        self.setMinimumWidth(520)
+        caja = QVBoxLayout(self)
+        caja.setContentsMargins(20, 18, 20, 18)
+        caja.setSpacing(10)
+        titulo = QLabel(plan_question(plan))
+        titulo.setObjectName("cardTitle")
+        titulo.setWordWrap(True)
+        caja.addWidget(titulo)
+        caja.addWidget(QLabel("¿Qué mes?"))
+        self.month_buttons: dict[Month, QRadioButton] = {}
+        grupo = QButtonGroup(self)
+        for opcion in plan.month_options:
+            boton = QRadioButton(opcion.label)
+            boton.toggled.connect(self._sync)
+            grupo.addButton(boton)
+            caja.addWidget(boton)
+            self.month_buttons[opcion.month] = boton
+        if not any(not o.partial for o in plan.month_options):
+            caja.addWidget(muted("El mes anterior no se ofrece: la cartera todavía no existía."))
+        self.info_label = QLabel()
+        self.info_label.setWordWrap(True)
+        caja.addWidget(self.info_label)
+        botones = QHBoxLayout()
+        botones.addStretch(1)
+        cancelar = QPushButton("Cancelar")
+        cancelar.setDefault(True)
+        cancelar.clicked.connect(self.reject)
+        botones.addWidget(cancelar)
+        self.accept_button = QPushButton(plan_button(plan))
+        self.accept_button.setObjectName("primary")
+        self.accept_button.clicked.connect(self.accept)
+        botones.addWidget(self.accept_button)
+        caja.addLayout(botones)
+        elegido = self.month_buttons.get(plan.study) if plan.study is not None else None
+        (elegido or next(iter(self.month_buttons.values()))).setChecked(True)
+        self._sync()
+
+    @property
+    def chosen(self) -> Month:
+        return next(m for m, b in self.month_buttons.items() if b.isChecked())
+
+    def choose(self, month: Month) -> None:
+        self.month_buttons[month].setChecked(True)
+
+    def _sync(self, *_args: object) -> None:
+        if not any(b.isChecked() for b in self.month_buttons.values()):
+            return
+        opcion = self.plan.option(self.chosen)
+        existente = opcion.existing if opcion is not None else None
+        self.info_label.setText("\n\n".join(plan_lines(self.plan, existente)))
 
 
 # -- la pantalla ----------------------------------------------------------------------------
@@ -755,7 +1129,7 @@ class ReportsPage(QWidget):
         self.browser.setMarkdown(report.markdown)
         self.export_button.setEnabled(True)
 
-    def _on_report_saved(self, outcome: DailyOutcome) -> None:
+    def _on_report_saved(self, outcome: ReportOutcome) -> None:
         self.reload(select_id=outcome.report.id)
 
     # -- exportar ----------------------------------------------------------------------

@@ -8,8 +8,9 @@ encima de todo, y las notificaciones, que manda por la bandeja (`set_notifier`).
 Operar registra algo (H8), vigila otra vez los niveles y pone al día el Panel y las Tesis; si una
 compra ha abierto una tesis, la enseña en Tesis para completarla.
 
-El control diario (H9) lo lanza el `ReportRunner` que comparten el Panel y los Informes; «Leer»
-lleva a Informes con ese informe abierto.
+Los tres informes (H9 y H10) los lanza el `ReportRunner` que comparten el Panel y los Informes;
+«Leer» lleva a Informes con ese informe abierto. Cuando el estudio mensual deja revisiones y
+propuestas en las tesis, Tesis se vuelve a leer.
 """
 
 from __future__ import annotations
@@ -124,8 +125,8 @@ class MainWindow(QMainWindow):
         if isinstance(panel, PanelPage):
             panel.summaryChanged.connect(self._sync_sidebar)
             panel.navigateRequested.connect(self.navigate)
-            if panel.daily_card is not None:
-                panel.daily_card.readRequested.connect(self.open_report)
+            for tarjeta in panel.report_cards:
+                tarjeta.readRequested.connect(self.open_report)
 
         # Los avisos de niveles: después de las páginas, para que el Panel ya esté al día
         # cuando salga la ventana de un stop.
@@ -322,12 +323,17 @@ class MainWindow(QMainWindow):
             pagina.select_report(report_id)
 
     def _on_report_done(self, outcome: object) -> None:
-        """El control diario ha terminado: los avisos de niveles que haya dejado (ya se
-        guardaron antes de llamar a Claude) se enseñan si no se habían enseñado."""
+        """Un informe ha terminado: los avisos de niveles que haya dejado (ya se guardaron
+        antes de llamar a Claude) se enseñan si no se habían enseñado; si el estudio mensual ha
+        añadido revisiones y propuestas a las tesis, Tesis se pone al día."""
         if self.levels is not None:
             niveles = getattr(outcome, "levels", None)
             if niveles is not None:
                 self.levels.notify_pending(niveles.checks)
+        if getattr(outcome, "thesis_events", ()):
+            tesis = self._pages.get("tesis")
+            if isinstance(tesis, ThesesPage):
+                tesis.reload()
 
     # -- avisos de niveles -----------------------------------------------------------------
 

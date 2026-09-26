@@ -48,20 +48,55 @@ RESPUESTA_POR_DEFECTO = (
 
 def mensaje_claude(texto: str = RESPUESTA_POR_DEFECTO, *, stop: str = "end_turn",
                    entrada: int = 2_000, salida: int = 600, razonamiento: bool = False,
-                   busquedas: int = 0, modelo: str = "claude-sonnet-5") -> SimpleNamespace:
+                   busquedas: int = 0, modelo: str = "claude-sonnet-5",
+                   bloques: list | None = None) -> SimpleNamespace:
     """Un mensaje final como el de `get_final_message()`: bloques, `stop_reason` y `usage`.
-    Con `razonamiento`, lleva un bloque de razonamiento (vacío, como en Sonnet 5)."""
-    bloques = []
+    Con `razonamiento`, lleva un bloque de razonamiento (vacío, como en Sonnet 5). Con
+    `bloques`, esos en lugar del texto (para búsquedas y citas: `busqueda()`, `texto_citado()`)."""
+    contenido = []
     if razonamiento:
-        bloques.append(SimpleNamespace(type="thinking", thinking=""))
-    if texto:
-        bloques.append(SimpleNamespace(type="text", text=texto))
+        contenido.append(SimpleNamespace(type="thinking", thinking=""))
+    if bloques is not None:
+        contenido.extend(bloques)
+    elif texto:
+        contenido.append(SimpleNamespace(type="text", text=texto, citations=None))
     uso = SimpleNamespace(
         input_tokens=entrada,
         output_tokens=salida,
         server_tool_use=SimpleNamespace(web_search_requests=busquedas) if busquedas else None,
     )
-    return SimpleNamespace(content=bloques, stop_reason=stop, usage=uso, model=modelo)
+    return SimpleNamespace(content=contenido, stop_reason=stop, usage=uso, model=modelo)
+
+
+def busqueda(consulta: str, *urls: str) -> list[SimpleNamespace]:
+    """Una búsqueda web del servidor: el bloque de la consulta y el de sus resultados."""
+    ident = "srvtoolu_" + "".join(c for c in consulta if c.isalnum())[:24]
+    return [
+        SimpleNamespace(type="server_tool_use", id=ident, name="web_search",
+                        input={"query": consulta}),
+        SimpleNamespace(type="web_search_tool_result", tool_use_id=ident, content=[
+            SimpleNamespace(type="web_search_result", url=u, title=f"Título de {u}",
+                            encrypted_content="cifrado", page_age=None)
+            for u in urls
+        ]),
+    ]
+
+
+def texto_citado(texto: str, *citas: tuple[str, str]) -> SimpleNamespace:
+    """Un bloque de texto con sus citas de la búsqueda web: (url, título)."""
+    return SimpleNamespace(type="text", text=texto, citations=[
+        SimpleNamespace(type="web_search_result_location", url=url, title=titulo,
+                        cited_text="…", encrypted_index="cifrado")
+        for url, titulo in citas
+    ])
+
+
+def extraccion(valor: object, *, entrada: int = 3_000, salida: int = 400,
+               stop: str = "end_turn", modelo: str = "claude-sonnet-5") -> SimpleNamespace:
+    """Lo que devuelve `messages.parse`: el objeto ya validado en `parsed_output`."""
+    uso = SimpleNamespace(input_tokens=entrada, output_tokens=salida, server_tool_use=None)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text="{}")],
+                           parsed_output=valor, stop_reason=stop, usage=uso, model=modelo)
 
 
 class FakeStream:
@@ -99,6 +134,10 @@ class FakeClaude:
     `mensaje_claude` o una excepción que se lanza al abrir el streaming); si no queda nada, un
     mensaje con `RESPUESTA_POR_DEFECTO`. `al_llamar(kwargs)` se ejecuta en cada llamada (para
     mirar la base de datos en ese momento) y `durante_stream(n)` con cada evento.
+
+    `messages.parse(...)` contesta, por orden, lo que haya en `extracciones` (un mensaje de
+    `extraccion()` o una excepción); si no queda nada, `por_defecto_parse(kwargs)` o, sin él,
+    una extracción vacía (sin datos).
     """
 
     def __init__(self, error: BaseException | None = None) -> None:
@@ -107,6 +146,8 @@ class FakeClaude:
         self.llamadas: list[tuple[str, dict]] = []
         self.cerrados = 0
         self.respuestas: list[object] = []
+        self.extracciones: list[object] = []
+        self.por_defecto_parse = None
         self.modelos: list[str] = ["claude-sonnet-5"]
         self.al_llamar = None
         self.durante_stream = None
@@ -121,7 +162,7 @@ class FakeClaude:
 
     @property
     def messages(self) -> SimpleNamespace:
-        return SimpleNamespace(stream=self._stream)
+        return SimpleNamespace(stream=self._stream, parse=self._parse)
 
     def list(self, **kwargs: object) -> list[SimpleNamespace]:
         self.llamadas.append(("models.list", kwargs))
@@ -136,10 +177,29 @@ class FakeClaude:
         respuesta = self.respuestas.pop(0) if self.respuestas else mensaje_claude()
         return FakeStream(self, respuesta)
 
+    def _parse(self, **kwargs: object) -> object:
+        self.llamadas.append(("messages.parse", kwargs))
+        if self.al_llamar is not None:
+            self.al_llamar(kwargs)
+        if self.extracciones:
+            respuesta = self.extracciones.pop(0)
+        elif self.por_defecto_parse is not None:
+            respuesta = self.por_defecto_parse(kwargs)
+        else:
+            respuesta = extraccion(None)
+        if isinstance(respuesta, BaseException):
+            raise respuesta
+        return respuesta
+
     @property
     def streams(self) -> list[dict]:
         """Lo que se pidió en cada `messages.stream`, por orden."""
         return [kwargs for nombre, kwargs in self.llamadas if nombre == "messages.stream"]
+
+    @property
+    def parses(self) -> list[dict]:
+        """Lo que se pidió en cada `messages.parse`, por orden."""
+        return [kwargs for nombre, kwargs in self.llamadas if nombre == "messages.parse"]
 
     def close(self) -> None:
         self.cerrados += 1

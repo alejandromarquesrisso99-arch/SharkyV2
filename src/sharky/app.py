@@ -242,6 +242,7 @@ def _check_ui() -> str:
 
     from PySide6.QtWidgets import QApplication
 
+    from sharky.core.reports import AIAction
     from sharky.services.db import Database
     from sharky.services.market import YahooMarket, local_now
     from sharky.services.selftest import CheckFailure
@@ -249,7 +250,7 @@ def _check_ui() -> str:
     from sharky.ui.pages import SECTIONS
     from sharky.ui.panel import PanelPage
     from sharky.ui.portfolio import PortfolioPage
-    from sharky.ui.reports import ReportsPage
+    from sharky.ui.reports import MonthlyRunDialog, ReportsPage
     from sharky.ui.theme import Theme, ThemeController
     from sharky.ui.theses import StopAlertDialog, ThesesPage
     from sharky.ui.trade import CashDialog, TradePage
@@ -282,8 +283,9 @@ def _check_ui() -> str:
             if not isinstance(operar, TradePage):
                 raise CheckFailure("la sección Operar no se ha construido")
             informes = ventana.page("informes")
-            if not isinstance(informes, ReportsPage) or panel.daily_card is None:
-                raise CheckFailure("Informes o la tarjeta del control diario no se han construido")
+            if not isinstance(informes, ReportsPage) or len(panel.report_cards) != 3:
+                raise CheckFailure("Informes o las tarjetas de los tres informes no se han "
+                                   "construido")
             ajustes = ventana.page("ajustes")
             if getattr(ajustes, "claude_card", None) is None:
                 raise CheckFailure("el apartado Claude de Ajustes no se ha construido")
@@ -293,6 +295,10 @@ def _check_ui() -> str:
             operar.reload()
             aviso = StopAlertDialog([])  # la ventana del aviso de stop
             efectivo = CashDialog(db, local_now, None, Decimal(0))  # «Ajustar saldo»
+            runner = ventana.reports_runner
+            if runner is None:
+                raise CheckFailure("no hay lanzador de informes")
+            mes = MonthlyRunDialog(runner.plan(AIAction.MONTHLY))  # elegir el mes del estudio
             tema.set_theme(Theme.DARK)
             cartera.grab()
             panel.grab()  # el gráfico del valor por participación (pyqtgraph)
@@ -302,8 +308,10 @@ def _check_ui() -> str:
             ajustes.grab()
             aviso.grab()
             efectivo.grab()
+            mes.grab()
             destroy_now(aviso)
             destroy_now(efectivo)
+            destroy_now(mes)
             ventana.close()
             destroy_now(ventana)
             _walk_setup_wizard(db, Path(carpeta))
@@ -311,8 +319,8 @@ def _check_ui() -> str:
             db.close_all()
     return (
         f"ventana creada, {len(SECTIONS)} secciones recorridas (Panel con su gráfico, Cartera, "
-        "Operar con su diálogo de efectivo, Tesis con su aviso de stop, Informes con el control "
-        "diario y Ajustes con Claude y Datos), "
+        "Operar con su diálogo de efectivo, Tesis con su aviso de stop, Informes con las "
+        "tarjetas de los tres informes y el diálogo del mensual, y Ajustes con Claude y Datos), "
         "temas claro y oscuro; asistente recorrido con la plantilla CSV"
     )
 
